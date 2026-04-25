@@ -1,0 +1,16 @@
+# 核心：PDF 解析
+marker-pdf>=0.2.17 ; python_version >= "3.10"
+
+# 回退 PDF 解析方案
+pdfplumber>=0.11.0
+pymupdf>=1.24.0
+
+# HTML 抓取与解析
+requests>=2.32.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+markdownify>=0.12.0
+
+# 工具
+tiktoken>=0.7.0
+tqdm>=4.66.0
