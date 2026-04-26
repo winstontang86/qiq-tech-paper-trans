@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import json
+import hashlib
 import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
@@ -34,6 +35,24 @@ TABLE_RE = re.compile(
 )
 IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\([^)\n]+\)")
 CITATION_RE = re.compile(r"\[\d+(?:,\s*\d+)*\]|\([A-Z][\w\-]+(?:\s+et\s+al\.?)?,?\s+\d{4}[a-z]?\)")
+PLACEHOLDER_RE = re.compile(r"⟦(CODE|FORMULA|INLINE_FORMULA|TABLE|IMAGE)_(\d{4})⟧")
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_locked_blocks(translated_md: Path) -> Dict[str, str]:
+    locked_path = translated_md.parent / "locked_blocks.json"
+    if not locked_path.exists():
+        return {}
+    return json.loads(locked_path.read_text(encoding="utf-8"))
+
+
+def _restore_placeholders(text: str, mapping: Dict[str, str]) -> str:
+    for ph, raw in mapping.items():
+        text = text.replace(ph, raw)
+    return text
 
 
 def count_elements(text: str) -> Dict[str, int]:
@@ -66,11 +85,21 @@ def check(source_md: Path, translated_md: Path, segments_path: Path,
     src = source_md.read_text(encoding="utf-8")
     tgt = translated_md.read_text(encoding="utf-8")
     segments = json.loads(segments_path.read_text(encoding="utf-8"))
+    locked_blocks = _load_locked_blocks(translated_md)
 
-    src_counts = count_elements(src)
+    included_segments = [seg for seg in segments if not seg.get("is_reference")]
+    excluded_segments = [seg for seg in segments if seg.get("is_reference")]
+    included_masked_src = "\n\n".join(seg.get("text", "") for seg in included_segments)
+    qa_src = _restore_placeholders(included_masked_src, locked_blocks) if included_masked_src else src
+    active_locked_blocks = {
+        ph: raw for ph, raw in locked_blocks.items()
+        if ph in included_masked_src
+    }
+
+    src_counts = count_elements(qa_src)
     tgt_counts = count_elements(tgt)
 
-    src_paragraphs = _paragraphs(src)
+    src_paragraphs = _paragraphs(qa_src)
     tgt_paragraphs = _paragraphs(tgt)
 
     blockers: List[Dict[str, Any]] = []
@@ -123,54 +152,85 @@ def check(source_md: Path, translated_md: Path, segments_path: Path,
     seg_rows = []
     bad_ratio_segs = []
     zh_dir = translated_md.parent / "zh_per_segment"
-    for seg in segments:
-        if seg.get("is_reference"):
+    units_path = translated_md.parent / "translation_units.json"
+    ratio_items = json.loads(units_path.read_text(encoding="utf-8")) if units_path.exists() else segments
+    for item in ratio_items:
+        if item.get("is_reference"):
             continue
-        zh_path = zh_dir / f"{seg['id']}.zh.md"
+        zh_path = zh_dir / f"{item['id']}.zh.md"
         if not zh_path.exists():
             continue
         zh_text = zh_path.read_text(encoding="utf-8").strip()
-        en_len = max(seg["char_len"], 1)
+        en_len = max(item.get("char_len", len(item.get("text", ""))), 1)
         zh_len = len(zh_text)
         ratio = zh_len / en_len
         status = "OK"
         if zh_len == 0:
             status = "EMPTY"
-            bad_ratio_segs.append((seg["id"], "empty", ratio))
+            bad_ratio_segs.append((item["id"], "empty", ratio))
         elif "B7" not in skip and not (0.3 <= ratio <= 2.5):
             status = "BAD"
-            bad_ratio_segs.append((seg["id"], f"{ratio:.2f}", ratio))
+            bad_ratio_segs.append((item["id"], f"{ratio:.2f}", ratio))
         seg_rows.append({
-            "id": seg["id"], "en": en_len, "zh": zh_len,
+            "id": item["id"], "en": en_len, "zh": zh_len,
             "ratio": round(ratio, 2), "status": status,
         })
     if "B7" not in skip and bad_ratio_segs:
         blockers.append({
             "id": "B7", "title": "段级长度比异常",
-            "detail": f"共 {len(bad_ratio_segs)} 段超出 [0.3, 2.5] 区间",
+            "detail": f"共 {len(bad_ratio_segs)} 个翻译单元超出 [0.3, 2.5] 区间",
             "segments": [s[0] for s in bad_ratio_segs[:20]],
         })
 
     # B8 摘要性短语
     if "B8" not in skip:
-        hit = [ph for ph in SUMMARY_PHRASES if ph in tgt]
+        hit = [ph for ph in SUMMARY_PHRASES if ph in tgt and ph not in src]
         if hit:
-            warnings.append({
-                "id": "B8", "title": "译文含摘要性短语",
+            blockers.append({
+                "id": "B8", "title": "译文含疑似摘要性短语",
                 "detail": f"命中: {', '.join(hit)}",
+            })
+
+    # B9 锁定块完整性
+    if "B9" not in skip and active_locked_blocks:
+        remaining_placeholders = sorted(set(m.group(0) for m in PLACEHOLDER_RE.finditer(tgt)))
+        missing_locked = []
+        for ph, raw in active_locked_blocks.items():
+            if raw not in tgt:
+                missing_locked.append({"placeholder": ph, "hash": _sha256(raw)})
+        if remaining_placeholders or missing_locked:
+            blockers.append({
+                "id": "B9", "title": "锁定块完整性异常",
+                "detail": f"未回贴占位符 {len(remaining_placeholders)} 个 / 缺失锁定块 {len(missing_locked)} 个",
+                "placeholders": remaining_placeholders[:20],
+                "locked_hashes": [x["placeholder"] + ":" + x["hash"][:12] for x in missing_locked[:20]],
+            })
+
+    # B10 References / Bibliography 及其后内容不应进入译文
+    if "B10" not in skip:
+        leaked = []
+        for seg in excluded_segments:
+            expected = _restore_placeholders(seg["text"], locked_blocks).strip()
+            if expected and expected in tgt:
+                leaked.append(seg["id"])
+        if leaked:
+            blockers.append({
+                "id": "B10", "title": "References 后内容误入译文",
+                "detail": f"共 {len(leaked)} 个已排除段仍出现在最终译文中",
+                "segments": leaked[:20],
             })
 
     # W4 疑似未翻译段（警告）
     untranslated = []
-    for seg in segments:
-        if seg.get("is_reference"):
+    for item in ratio_items:
+        if item.get("is_reference"):
             continue
-        zh_path = zh_dir / f"{seg['id']}.zh.md"
+        zh_path = zh_dir / f"{item['id']}.zh.md"
         if not zh_path.exists():
             continue
         zh = zh_path.read_text(encoding="utf-8").strip()
         if zh and _is_mostly_english(zh):
-            untranslated.append(seg["id"])
+            untranslated.append(item["id"])
     if untranslated:
         warnings.append({
             "id": "W4", "title": "疑似未翻译段落",
@@ -188,9 +248,62 @@ def check(source_md: Path, translated_md: Path, segments_path: Path,
         "blockers": blockers,
         "warnings": warnings,
         "segments": seg_rows,
+        "locked_blocks": len(active_locked_blocks),
+        "excluded_segments": len(excluded_segments),
         "passed": len(blockers) == 0,
     }
     return summary, blockers
+
+
+def write_fix_prompts(summary: Dict[str, Any], out_dir: Path) -> Path | None:
+    """根据 QA 阻断项生成定向修复 prompt。"""
+    blockers = summary.get("blockers", [])
+    if not blockers:
+        return None
+
+    fix_dir = out_dir / "fix_prompts"
+    fix_dir.mkdir(parents=True, exist_ok=True)
+
+    common = [
+        "你是技术论文翻译质检修复助手。",
+        "请只修复指定问题，不要重写无关内容；必须忠实原文，不得摘要、省略或补写。",
+        "占位符、公式、代码、图片、表格、引用编号必须原样保留。",
+        "输出时只给出修复后的译文片段或明确的替换内容，不要解释。",
+        "",
+    ]
+
+    for blocker in blockers:
+        bid = blocker["id"]
+        targets = blocker.get("segments") or ["global"]
+        for target in targets[:20]:
+            path = fix_dir / f"{bid}_{target}.fix.md"
+            lines = [f"# 修复任务 {bid} {target}", ""] + common + [
+                "## 问题",
+                "",
+                f"- {blocker['title']}",
+                f"- {blocker['detail']}",
+                "",
+                "## 修复要求",
+                "",
+            ]
+            if target != "global":
+                lines += [
+                    f"- 优先检查 `zh_per_segment/{target}.zh.md`。",
+                    "- 对照对应 prompt 与原文，补齐缺失内容或恢复被改动的结构。",
+                ]
+            else:
+                lines += [
+                    "- 检查最终译文、`translated_raw.md`、`locked_blocks.json` 与相关 `zh_per_segment/*.zh.md`。",
+                    "- 定位导致该阻断项的具体翻译单元后，仅修复对应文件。",
+                ]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    index = fix_dir / "INDEX.md"
+    lines = ["# QA 修复任务索引", "", "| blocker | title | detail |", "|---|---|---|"]
+    for blocker in blockers:
+        lines.append(f"| {blocker['id']} | {blocker['title']} | {blocker['detail']} |")
+    index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return fix_dir
 
 
 def write_report(summary: Dict[str, Any], out_path: Path) -> Path:
@@ -201,6 +314,8 @@ def write_report(summary: Dict[str, Any], out_path: Path) -> Path:
         f"- 译文：`{summary['translated']}`",
         f"- 原文段数：{summary['src_paragraphs']}  /  译文段数：{summary['tgt_paragraphs']}",
         f"- 结论：**{'通过' if summary['passed'] else '阻断'}**",
+        f"- 锁定块数量：{summary.get('locked_blocks', 0)}",
+        f"- 已排除 References 后段数：{summary.get('excluded_segments', 0)}",
         "",
         "## 元素计数对比",
         "",
@@ -221,6 +336,10 @@ def write_report(summary: Dict[str, Any], out_path: Path) -> Path:
             lines.append(f"- {b['detail']}")
             if "segments" in b:
                 lines.append(f"- 相关段: {', '.join(b['segments'])}")
+            if "placeholders" in b and b["placeholders"]:
+                lines.append(f"- 未回贴占位符: {', '.join(b['placeholders'])}")
+            if "locked_hashes" in b and b["locked_hashes"]:
+                lines.append(f"- 缺失锁定块哈希: {', '.join(b['locked_hashes'])}")
             lines.append("")
 
     if summary["warnings"]:
@@ -263,9 +382,13 @@ def main():
         Path(args.source), Path(args.translated), Path(args.segments), skip_checks=skip
     )
     write_report(summary, Path(args.report))
+    fix_dir = write_fix_prompts(summary, Path(args.report).parent)
 
     if blockers and not args.force:
-        print(f"[qa] BLOCKED: {len(blockers)} blocker(s). See {args.report}")
+        msg = f"[qa] BLOCKED: {len(blockers)} blocker(s). See {args.report}"
+        if fix_dir:
+            msg += f"; fix prompts: {fix_dir}"
+        print(msg)
         raise SystemExit(2)
     print(f"[qa] OK (blockers={len(blockers)}, warnings={len(summary['warnings'])})")
 

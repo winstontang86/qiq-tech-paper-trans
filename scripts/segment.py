@@ -1,10 +1,10 @@
 """segment.py —— 结构化 Markdown 分段 + 锁定块占位符化。
 
 职责：
-1. 识别 locked blocks（公式、代码、表格、图片、引用编号、参考文献段），替换为稳定占位符。
+1. 识别 locked blocks（公式、代码、表格、图片、引用编号），替换为稳定占位符。
 2. 按段落自然边界分段；段落长度控制在目标 token 区间。
 3. 识别大章节标题；分段不跨越大章节。
-4. 识别参考文献节（References / Bibliography），整节作为不翻译段。
+4. 识别参考文献节（References / Bibliography），从该节开始及其后所有内容均标记为跳过，不进入最终译文。
 
 输出：
 - <outdir>/segments.json     —— 段落列表 + 元信息
@@ -49,9 +49,9 @@ TABLE_RE = re.compile(
 # Image: ![alt](url) —— 单行
 IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\([^)\n]+\)")
 
-# Reference section header
+# Reference cutoff header
 REFERENCES_HEADER_RE = re.compile(
-    r"^#{1,3}\s*(references|bibliography|参考文献)\s*$",
+    r"^(#{1,6})\s*(references\b.*|bibliography\b.*|参考文献.*)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -60,8 +60,16 @@ def _placeholder(kind: str, idx: int) -> str:
     return f"⟦{kind}_{idx:04d}⟧"
 
 
-def mask_locked_blocks(md: str) -> (str, Dict[str, str]):
-    """Replace locked blocks with placeholders. Return (masked_md, mapping)."""
+def mask_locked_blocks(md: str, table_mode: str = "lock") -> tuple[str, Dict[str, str]]:
+    """Replace locked blocks with placeholders. Return (masked_md, mapping).
+
+    table_mode:
+    - lock: Markdown 表格整体锁定为占位符，最大化防丢失。
+    - translate: 表格不锁定，交给翻译 prompt 要求保持列数/分隔线并翻译文字单元格。
+    """
+    if table_mode not in {"lock", "translate"}:
+        raise ValueError(f"Unknown table_mode: {table_mode}")
+
     mapping: Dict[str, str] = {}
     counters: Dict[str, int] = {}
 
@@ -79,7 +87,8 @@ def mask_locked_blocks(md: str) -> (str, Dict[str, str]):
 
     masked = md
     masked = replace_one(masked, CODE_BLOCK_RE, "CODE")
-    masked = replace_one(masked, TABLE_RE, "TABLE")
+    if table_mode == "lock":
+        masked = replace_one(masked, TABLE_RE, "TABLE")
     for pat, kind in FORMULA_PATTERNS:
         masked = replace_one(masked, pat, kind)
     masked = replace_one(masked, IMAGE_RE, "IMAGE")
@@ -165,34 +174,31 @@ def segment(masked_md: str, mapping: Dict[str, str]) -> List[Dict[str, Any]]:
     Each segment: {
       id, section_heading, section_level,
       text,            # masked text (with placeholders)
-      is_reference,    # True if in References section (skip translation)
+      is_reference,    # True if at/after References section (excluded from final translation)
       char_len,
     }
     """
     sections = split_sections(masked_md)
     segments: List[Dict[str, Any]] = []
     seg_idx = 0
+    after_references = False
 
-    for sec in sections:
-        is_ref = _is_references_section(sec["heading_text"])
-        paragraphs = _split_paragraphs(sec["body"])
-        # Heading itself is first paragraph — pack with body
+    def append_reference_segment(sec: Dict[str, Any], paragraphs: List[str], heading_text: str | None = None) -> None:
+        nonlocal seg_idx
         if not paragraphs:
-            continue
+            return
+        seg_idx += 1
+        segments.append({
+            "id": f"seg_{seg_idx:04d}",
+            "section_heading": heading_text if heading_text is not None else sec["heading_text"],
+            "section_level": sec["heading_level"],
+            "text": "\n\n".join(paragraphs),
+            "is_reference": True,
+            "char_len": sum(len(p) for p in paragraphs),
+        })
 
-        if is_ref:
-            # References whole section as one big segment, marked untranslate
-            seg_idx += 1
-            segments.append({
-                "id": f"seg_{seg_idx:04d}",
-                "section_heading": sec["heading_text"],
-                "section_level": sec["heading_level"],
-                "text": "\n\n".join(paragraphs),
-                "is_reference": True,
-                "char_len": sum(len(p) for p in paragraphs),
-            })
-            continue
-
+    def append_translatable_segments(sec: Dict[str, Any], paragraphs: List[str]) -> None:
+        nonlocal seg_idx
         chunks = _pack_paragraphs(paragraphs)
         for ch in chunks:
             seg_idx += 1
@@ -204,19 +210,52 @@ def segment(masked_md: str, mapping: Dict[str, str]) -> List[Dict[str, Any]]:
                 "is_reference": False,
                 "char_len": len(ch),
             })
+
+    for sec in sections:
+        if _is_references_section(sec["heading_text"]):
+            after_references = True
+        body = sec["body"]
+        if not after_references:
+            ref_match = REFERENCES_HEADER_RE.search(body)
+            if ref_match:
+                before_body = body[:ref_match.start()].strip("\n")
+                after_body = body[ref_match.start():].strip("\n")
+                before_paragraphs = _split_paragraphs(before_body)
+                append_translatable_segments(sec, before_paragraphs)
+
+                after_references = True
+                ref_heading = re.sub(r"^#{1,6}\s*", "", ref_match.group(0).strip()).strip()
+                append_reference_segment(sec, _split_paragraphs(after_body), ref_heading)
+                continue
+
+        is_ref = after_references
+        paragraphs = _split_paragraphs(body)
+        # Heading itself is first paragraph — pack with body
+        if not paragraphs:
+            continue
+
+        if is_ref:
+            # References and all following sections are excluded from final translation.
+            append_reference_segment(sec, paragraphs)
+            continue
+
+        append_translatable_segments(sec, paragraphs)
     return segments
 
 
-def run(source_md_path: Path, outdir: Path) -> Dict[str, Path]:
+def run(source_md_path: Path, outdir: Path, table_mode: str = "lock") -> Dict[str, Path]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     md = source_md_path.read_text(encoding="utf-8")
-    masked, mapping = mask_locked_blocks(md)
+    masked, mapping = mask_locked_blocks(md, table_mode=table_mode)
 
     (outdir / "masked.md").write_text(masked, encoding="utf-8")
     (outdir / "locked_blocks.json").write_text(
         json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (outdir / "segment_config.json").write_text(
+        json.dumps({"table_mode": table_mode}, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     segments = segment(masked, mapping)
@@ -234,8 +273,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True, help="source.md from preprocess step")
     ap.add_argument("--outdir", required=True)
+    ap.add_argument("--table-mode", choices=["lock", "translate"], default="lock",
+                    help="lock Markdown tables as placeholders or translate textual table cells")
     args = ap.parse_args()
-    out = run(Path(args.source), Path(args.outdir))
+    out = run(Path(args.source), Path(args.outdir), table_mode=args.table_mode)
     for k, v in out.items():
         print(f"{k}\t{v}")
 

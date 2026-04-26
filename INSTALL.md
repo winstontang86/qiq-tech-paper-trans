@@ -1,29 +1,43 @@
 # 安装说明
 
-## 方式一：用户级安装（推荐）
+本 skill 的核心运行方式是 **Python 脚本 + 文件协议**，不绑定 WorkBuddy、OpenClaw 或任何特定 Agent 平台。任意平台只要能执行 Python、读取 prompt 文件、调用 LLM 并写回译文文件，都可以集成。
 
-解压到：
+## 方式一：通用本地安装（推荐）
 
+解压或克隆到任意目录，例如：
+
+```bash
+/path/to/technical-paper-translation/
 ```
+
+之后通过脚本绝对路径或进入目录后运行：
+
+```bash
+cd /path/to/technical-paper-translation
+python3 scripts/run.py --help
+```
+
+## 方式二：宿主平台安装
+
+如果宿主平台有自己的 skill / tool 目录，可放入对应目录。例如：
+
+```bash
+# WorkBuddy / CodeBuddy 示例
 ~/.workbuddy/skills/technical-paper-translation/
-```
 
-加载方式：由 WorkBuddy / CodeBuddy 的 skill 机制自动识别。
-
-## 方式二：项目级安装
-
-解压到项目根目录下：
-
-```
+# 项目级 WorkBuddy / CodeBuddy 示例
 <project>/.workbuddy/skills/technical-paper-translation/
+
+# OpenClaw 或其他平台
+<platform-skill-dir>/technical-paper-translation/
 ```
 
-仅对当前项目生效。
+平台只需要把 `entrypoint` 指向 `scripts/run.py`，并按照 `SKILL.md` 中的文件协议执行 prepare、翻译写回、finalize 三步。
 
 ## 依赖安装
 
 ```bash
-cd ~/.workbuddy/skills/technical-paper-translation
+cd /path/to/technical-paper-translation
 python3 -m pip install -r requirements.txt
 ```
 
@@ -39,4 +53,4 @@ python3 scripts/run.py --help
 
 ## 版本
 
-v0.1.0
+v0.2.2

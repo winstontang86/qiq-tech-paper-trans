@@ -1,21 +1,21 @@
-"""translate.py —— 按段生成滑动窗口三段法 prompt，并收集译文。
+"""translate.py —— 按翻译单元生成滑动窗口 prompt，并收集译文。
 
 设计：
-  本 skill 不直接调用 LLM API。由于 WorkBuddy 外层 Agent 本身就是 LLM，我们把每段的
-  翻译请求写成结构化 prompt 文件，Agent 读取并逐段产出译文后回写到约定路径。
+  本 skill 不直接绑定任何 LLM API 或特定 Agent 平台。它把每个翻译单元的请求写成
+  结构化 prompt 文件，任何宿主平台或外部 LLM 执行器只要能读取 prompt、调用模型、
+  并把译文写回约定路径，就可以完成翻译流程。
 
-支持两种模式：
-  --mode generate   生成 prompts/ 目录下的 <seg_id>.prompt.md 与空的 <seg_id>.zh.md。
-                    同时生成 INDEX.md 指导 Agent 如何逐段翻译。
-  --mode collect    扫描 <seg_id>.zh.md（已由 Agent 填写），组装成 translated.md。
-                    参考文献段直接保留原文。
+支持三种翻译单元：
+  segment：逐段翻译，最稳。
+  section：逐章节翻译，最快。
+  hybrid：短章节整章翻译，长章节按段落边界拆成章节 part，推荐默认提速模式。
 
 断点续译：
   collect 阶段遇到空 zh.md 会警告；generate 阶段不会覆盖已有非空 zh.md。
+  generate 会优先把上一翻译单元已完成的中文译文放入 previous_zh_context；若不存在则回退上一单元英文原文。
 """
 from __future__ import annotations
 
-import os
 import re
 import sys
 import json
@@ -27,6 +27,7 @@ from typing import List, Dict, Any
 # 窗口大小（字符数，近似 token * 4）
 PREV_WINDOW_CHARS = 800 * 4
 NEXT_WINDOW_CHARS = 800 * 4
+HYBRID_MAX_CHARS = 12000
 
 
 def load_glossary(builtin_path: Path, user_path: Path | None) -> Dict[str, str]:
@@ -54,35 +55,125 @@ def _filter_glossary_for_text(glossary: Dict[str, str], text: str) -> List[str]:
     return lines
 
 
-def _build_window(segments: List[Dict[str, Any]], idx: int) -> Dict[str, str]:
-    """为第 idx 段构建 prev / next 窗口；不跨越 section。"""
-    cur = segments[idx]
+def _segment_to_unit(seg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": seg["id"],
+        "kind": "segment",
+        "segment_ids": [seg["id"]],
+        "section_heading": seg.get("section_heading", ""),
+        "section_level": seg.get("section_level", 0),
+        "text": seg["text"],
+        "is_reference": bool(seg.get("is_reference")),
+        "char_len": seg.get("char_len", len(seg["text"])),
+    }
+
+
+def _flush_unit(units: List[Dict[str, Any]], section_idx: int, part_idx: int,
+                section: Dict[str, Any], bucket: List[Dict[str, Any]]) -> None:
+    if not bucket:
+        return
+    unit_id = f"sec_{section_idx:04d}" if part_idx == 1 else f"sec_{section_idx:04d}_part_{part_idx:03d}"
+    text = "\n\n".join(seg["text"] for seg in bucket)
+    units.append({
+        "id": unit_id,
+        "kind": "section" if len(bucket) > 1 else "segment",
+        "segment_ids": [seg["id"] for seg in bucket],
+        "section_heading": section["heading"],
+        "section_level": section["level"],
+        "text": text,
+        "is_reference": all(bool(seg.get("is_reference")) for seg in bucket),
+        "char_len": len(text),
+    })
+
+
+def build_translation_units(segments: List[Dict[str, Any]], unit_mode: str = "segment",
+                            hybrid_max_chars: int = HYBRID_MAX_CHARS) -> List[Dict[str, Any]]:
+    """把 segment 列表转换为翻译单元。"""
+    if unit_mode not in {"segment", "section", "hybrid"}:
+        raise ValueError(f"Unknown unit_mode: {unit_mode}")
+    if unit_mode == "segment":
+        return [_segment_to_unit(seg) for seg in segments]
+
+    sections: List[Dict[str, Any]] = []
+    current: Dict[str, Any] | None = None
+    for seg in segments:
+        key = (seg.get("section_heading", ""), seg.get("section_level", 0))
+        if current is None or current["key"] != key:
+            current = {
+                "key": key,
+                "heading": seg.get("section_heading", ""),
+                "level": seg.get("section_level", 0),
+                "segments": [],
+            }
+            sections.append(current)
+        current["segments"].append(seg)
+
+    units: List[Dict[str, Any]] = []
+    for section_idx, section in enumerate(sections, start=1):
+        sec_segments = section["segments"]
+        if unit_mode == "section":
+            _flush_unit(units, section_idx, 1, section, sec_segments)
+            continue
+
+        part_idx = 1
+        bucket: List[Dict[str, Any]] = []
+        used = 0
+        for seg in sec_segments:
+            seg_len = seg.get("char_len", len(seg["text"]))
+            if bucket and used + seg_len + 2 > hybrid_max_chars:
+                _flush_unit(units, section_idx, part_idx, section, bucket)
+                part_idx += 1
+                bucket = []
+                used = 0
+            bucket.append(seg)
+            used += seg_len + 2
+        _flush_unit(units, section_idx, part_idx, section, bucket)
+    return units
+
+
+def _read_existing_zh(zh_dir: Path, unit_id: str) -> str:
+    zh_path = zh_dir / f"{unit_id}.zh.md"
+    if not zh_path.exists():
+        return ""
+    return zh_path.read_text(encoding="utf-8").strip()
+
+
+def _build_window(units: List[Dict[str, Any]], idx: int, zh_dir: Path) -> Dict[str, str]:
+    """为第 idx 个翻译单元构建 previous_zh / previous_source / next_source 窗口；不跨越 section。"""
+    cur = units[idx]
     cur_section = cur.get("section_heading", "")
 
-    def gather(start: int, step: int, budget: int) -> str:
-        pieces = []
-        used = 0
-        i = start
-        while 0 <= i < len(segments) and used < budget:
-            if segments[i].get("section_heading", "") != cur_section:
-                break
-            if segments[i].get("is_reference"):
-                break
-            piece = segments[i]["text"]
-            if used + len(piece) > budget:
-                # 截取片段末尾或开头
-                take = budget - used
-                piece = piece[-take:] if step < 0 else piece[:take]
-            pieces.append(piece)
-            used += len(piece)
-            i += step
-        if step < 0:
-            pieces.reverse()
-        return "\n\n".join(pieces).strip()
+    def same_section(i: int) -> bool:
+        return units[i].get("section_heading", "") == cur_section and not units[i].get("is_reference")
 
-    prev_text = gather(idx - 1, -1, PREV_WINDOW_CHARS)
-    next_text = gather(idx + 1, +1, NEXT_WINDOW_CHARS)
-    return {"prev": prev_text, "next": next_text}
+    previous_zh = ""
+    previous_source = ""
+    if idx > 0 and same_section(idx - 1):
+        previous_zh = _read_existing_zh(zh_dir, units[idx - 1]["id"])
+        previous_source = units[idx - 1]["text"]
+        if len(previous_zh) > PREV_WINDOW_CHARS:
+            previous_zh = previous_zh[-PREV_WINDOW_CHARS:]
+        if len(previous_source) > PREV_WINDOW_CHARS:
+            previous_source = previous_source[-PREV_WINDOW_CHARS:]
+
+    next_pieces = []
+    used = 0
+    i = idx + 1
+    while i < len(units) and used < NEXT_WINDOW_CHARS:
+        if not same_section(i):
+            break
+        piece = units[i]["text"]
+        if used + len(piece) > NEXT_WINDOW_CHARS:
+            piece = piece[:NEXT_WINDOW_CHARS - used]
+        next_pieces.append(piece)
+        used += len(piece)
+        i += 1
+
+    return {
+        "previous_zh": previous_zh,
+        "previous_source": previous_source,
+        "next_source": "\n\n".join(next_pieces).strip(),
+    }
 
 
 SYSTEM_PROMPT = """你是专业的技术论文译者，擅长 AI/机器学习领域英文论文的中文翻译。严格遵循以下规则：
@@ -92,6 +183,7 @@ SYSTEM_PROMPT = """你是专业的技术论文译者，擅长 AI/机器学习领
 【结构保真】
 - Markdown 结构（标题 # 层级、列表、引用块）一比一保留。
 - 文本中的占位符形如 ⟦CODE_0001⟧、⟦FORMULA_0003⟧、⟦TABLE_0002⟧、⟦IMAGE_0005⟧、⟦INLINE_FORMULA_0004⟧，这些都代表被锁定的内容（公式/代码/表格/图片），必须原样保留在译文对应位置，不得改动，不得翻译。
+- 如果 Markdown 表格没有被替换成 ⟦TABLE_0001⟧ 这类占位符，必须一比一保留表格列数、分隔线、行数、数字、单位和变量符号，只翻译自然语言文字单元格。
 - 引用编号 [12]、[Author, 2024]、(Smith et al., 2023) 原样保留。
 
 【术语】
@@ -100,7 +192,7 @@ SYSTEM_PROMPT = """你是专业的技术论文译者，擅长 AI/机器学习领
 - 专有名词（模型名、机构名、人名、数据集名）保留英文原样。
 - 缩写首次出现："中文全称（英文缩写）"；后续只用缩写。
 
-【上下文】<previous_context> 和 <next_context> 仅用于理解上下文，不得翻译它们。只输出 <current_segment> 的中文译文。
+【上下文】<previous_zh_context> 是上一翻译单元已完成的中文译文，优先用于延续术语、语气和指代；<previous_source_fallback> 与 <next_source_context> 仅用于理解上下文，不得翻译。只输出 <current_source> 的中文译文。
 
 【数字、单位、日期】保留原格式；单位不译；年份日期保留原写法。
 
@@ -108,28 +200,39 @@ SYSTEM_PROMPT = """你是专业的技术论文译者，擅长 AI/机器学习领
 """
 
 
-USER_TEMPLATE = """<previous_context>
-{prev}
-</previous_context>
+USER_TEMPLATE = """<previous_zh_context source="{previous_zh_source}">
+{previous_zh}
+</previous_zh_context>
 
-<current_segment id="{seg_id}">
+<previous_source_fallback>
+{previous_source}
+</previous_source_fallback>
+
+<current_source id="{unit_id}" segments="{segment_ids}">
 {current}
-</current_segment>
+</current_source>
 
-<next_context>
-{next}
-</next_context>
+<next_source_context>
+{next_source}
+</next_source_context>
 
 <glossary>
 {glossary}
 </glossary>
 
-请翻译 <current_segment> 的内容为中文。仅输出译文本身，不要输出上下文和任何解释。
+请翻译 <current_source> 的内容为中文。仅输出译文本身，不要输出上下文和任何解释。
+
+执行前检查：如果 {previous_zh_source} 存在且非空，请先读取它，并用其内容替换 <previous_zh_context> 中的占位说明；该中文上下文只用于延续术语、语气和指代，不得重复翻译。
 """
 
 
-def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str]) -> None:
+def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str],
+             unit_mode: str = "segment", hybrid_max_chars: int = HYBRID_MAX_CHARS) -> None:
     segments: List[Dict[str, Any]] = json.loads(segments_path.read_text(encoding="utf-8"))
+    units = build_translation_units(segments, unit_mode=unit_mode, hybrid_max_chars=hybrid_max_chars)
+    (outdir / "translation_units.json").write_text(
+        json.dumps(units, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     prompts_dir = outdir / "prompts_per_segment"
     zh_dir = outdir / "zh_per_segment"
@@ -137,46 +240,57 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str]) -> Non
     zh_dir.mkdir(parents=True, exist_ok=True)
 
     index_lines = [
-        "# 段落翻译任务索引",
+        "# 翻译任务索引",
         "",
-        "## 给 LLM Agent 的说明",
+        "## 给外部 LLM 执行器的说明",
         "",
-        "- 对每个段落 seg_XXXX：",
-        "  1. 读取 `prompts_per_segment/seg_XXXX.prompt.md`",
-        "  2. 其中 system 部分放在本次 LLM 调用的 system prompt；user 部分作为 user message。",
-        "  3. 将 LLM 输出的中文译文写入 `zh_per_segment/seg_XXXX.zh.md`（覆盖写）。",
-        "  4. is_reference=True 的段落无需翻译（已自动跳过）。",
-        "- 全部段落翻译完后，执行：",
+        f"- 当前翻译单元模式：`{unit_mode}`。",
+        "- 本目录采用平台中立的文件协议，不依赖 WorkBuddy、OpenClaw 或任何特定宿主。",
+        "- 对每个翻译单元 unit_id：",
+        "  1. 读取 `prompts_per_segment/<unit_id>.prompt.md`。",
+        "  2. 将 `# SYSTEM` 部分作为 system prompt；将 `# USER` 部分作为 user message。若宿主平台不支持 system 角色，可把 system 内容放在 user message 开头。",
+        "  3. 将 LLM 输出的中文译文写入 `zh_per_segment/<unit_id>.zh.md`（覆盖写）。",
+        "  4. is_reference=True 的单元位于 References / Bibliography 及其后，已从最终译文中排除，无需翻译。",
+        "- 为了让 `previous_zh_context` 使用上一单元中文译文，建议按索引顺序翻译；如果需要刷新后续 prompt，可在已有译文基础上重新运行 prepare/generate。",
+        "- 全部翻译完后，执行：",
         "  `python3 translate.py --mode collect --workdir <outdir>` 组装译文。",
         "",
-        "## 段落清单",
+        "## 翻译单元清单",
         "",
-        "| seg_id | section | char_len | is_reference | status |",
-        "|---|---|---|---|---|",
+        "| unit_id | segments | section | char_len | is_reference | status |",
+        "|---|---|---|---|---|---|",
     ]
 
-    for idx, seg in enumerate(segments):
-        seg_id = seg["id"]
-        zh_path = zh_dir / f"{seg_id}.zh.md"
-        prompt_path = prompts_dir / f"{seg_id}.prompt.md"
+    for idx, unit in enumerate(units):
+        unit_id = unit["id"]
+        zh_path = zh_dir / f"{unit_id}.zh.md"
+        prompt_path = prompts_dir / f"{unit_id}.prompt.md"
 
-        if seg.get("is_reference"):
-            # Auto-fill with original (no translation)
-            zh_path.write_text(seg["text"], encoding="utf-8")
+        if unit.get("is_reference"):
             index_lines.append(
-                f"| {seg_id} | {seg['section_heading']} | {seg['char_len']} | yes | skipped |"
+                f"| {unit_id} | {', '.join(unit['segment_ids'])} | {unit['section_heading']} | {unit['char_len']} | yes | excluded |"
             )
             continue
 
-        window = _build_window(segments, idx)
-        gloss_lines = _filter_glossary_for_text(glossary, seg["text"] + "\n" + window["prev"] + "\n" + window["next"])
+        window = _build_window(units, idx, zh_dir)
+        previous_unit_id = ""
+        if idx > 0 and units[idx - 1].get("section_heading", "") == unit.get("section_heading", "") and not units[idx - 1].get("is_reference"):
+            previous_unit_id = units[idx - 1]["id"]
+        previous_zh_source = f"zh_per_segment/{previous_unit_id}.zh.md" if previous_unit_id else "（无同章节上一翻译单元）"
+        gloss_lines = _filter_glossary_for_text(
+            glossary,
+            unit["text"] + "\n" + window["previous_zh"] + "\n" + window["previous_source"] + "\n" + window["next_source"],
+        )
         glossary_text = "\n".join(gloss_lines) if gloss_lines else "（无需特别关注的术语）"
 
         user_msg = USER_TEMPLATE.format(
-            prev=window["prev"] or "（本段为文档开头或章节开头）",
-            seg_id=seg_id,
-            current=seg["text"],
-            next=window["next"] or "（本段为文档末尾或章节末尾）",
+            previous_zh_source=previous_zh_source,
+            previous_zh=window["previous_zh"] or "（上一翻译单元暂无中文译文，翻译执行前若 previous_zh_context source 指向的文件已存在，请读取该文件内容作为中文上下文；否则使用 previous_source_fallback 辅助理解）",
+            previous_source=window["previous_source"] or "（本单元为文档开头或章节开头）",
+            unit_id=unit_id,
+            segment_ids=", ".join(unit["segment_ids"]),
+            current=unit["text"],
+            next_source=window["next_source"] or "（本单元为文档末尾或章节末尾）",
             glossary=glossary_text,
         )
 
@@ -188,32 +302,38 @@ def generate(segments_path: Path, outdir: Path, glossary: Dict[str, str]) -> Non
         )
         prompt_path.write_text(prompt_md, encoding="utf-8")
 
-        # Only create empty zh file if not exists (resume-friendly)
         if not zh_path.exists():
             zh_path.write_text("", encoding="utf-8")
 
         status = "done" if zh_path.read_text(encoding="utf-8").strip() else "pending"
         index_lines.append(
-            f"| {seg_id} | {seg['section_heading']} | {seg['char_len']} | no | {status} |"
+            f"| {unit_id} | {', '.join(unit['segment_ids'])} | {unit['section_heading']} | {unit['char_len']} | no | {status} |"
         )
 
     (outdir / "INDEX.md").write_text("\n".join(index_lines), encoding="utf-8")
 
 
-def collect(segments_path: Path, outdir: Path) -> Path:
+def _load_units_for_collect(segments_path: Path, outdir: Path) -> List[Dict[str, Any]]:
+    units_path = outdir / "translation_units.json"
+    if units_path.exists():
+        return json.loads(units_path.read_text(encoding="utf-8"))
     segments: List[Dict[str, Any]] = json.loads(segments_path.read_text(encoding="utf-8"))
+    return [_segment_to_unit(seg) for seg in segments]
+
+
+def collect(segments_path: Path, outdir: Path) -> Path:
+    units = _load_units_for_collect(segments_path, outdir)
     zh_dir = outdir / "zh_per_segment"
 
     pieces = []
     missing = []
-    for seg in segments:
-        zh_path = zh_dir / f"{seg['id']}.zh.md"
+    for unit in units:
+        if unit.get("is_reference"):
+            continue
+        zh_path = zh_dir / f"{unit['id']}.zh.md"
         if not zh_path.exists() or not zh_path.read_text(encoding="utf-8").strip():
-            if seg.get("is_reference"):
-                pieces.append(seg["text"])
-            else:
-                missing.append(seg["id"])
-                pieces.append(f"\n[!MISSING TRANSLATION: {seg['id']}]\n\n" + seg["text"])
+            missing.append(unit["id"])
+            pieces.append(f"\n[!MISSING TRANSLATION: {unit['id']}]\n\n" + unit["text"])
             continue
         pieces.append(zh_path.read_text(encoding="utf-8").rstrip())
 
@@ -222,7 +342,7 @@ def collect(segments_path: Path, outdir: Path) -> Path:
     out_path.write_text(translated, encoding="utf-8")
 
     if missing:
-        print(f"[translate.collect] WARNING: {len(missing)} segments missing translations: "
+        print(f"[translate.collect] WARNING: {len(missing)} translation units missing: "
               f"{', '.join(missing[:10])}{'...' if len(missing) > 10 else ''}",
               file=sys.stderr)
     return out_path
@@ -235,6 +355,8 @@ def main():
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--glossary-builtin", default=None)
     ap.add_argument("--glossary-user", default=None)
+    ap.add_argument("--unit-mode", choices=["segment", "section", "hybrid"], default="hybrid")
+    ap.add_argument("--hybrid-max-chars", type=int, default=HYBRID_MAX_CHARS)
     args = ap.parse_args()
 
     workdir = Path(args.workdir)
@@ -245,7 +367,8 @@ def main():
             Path(__file__).parent.parent / "references" / "glossary_ai_ml.json"
         )
         glossary = load_glossary(builtin, Path(args.glossary_user) if args.glossary_user else None)
-        generate(segments_path, workdir, glossary)
+        generate(segments_path, workdir, glossary,
+                 unit_mode=args.unit_mode, hybrid_max_chars=args.hybrid_max_chars)
         print(f"[translate] generated prompts under {workdir}/prompts_per_segment/")
     else:
         out = collect(segments_path, workdir)

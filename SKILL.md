@@ -1,11 +1,14 @@
 ---
 name: technical-paper-translation
-version: 0.1.0
+version: 0.2.3
 description: |
   英文技术论文翻译为中文（信达雅学术风格）。支持本地 PDF 文件与 URL 输入（arXiv
   链接优先抓取 HTML 版本）。针对 AI/ML 论文深度优化，兼容通用技术论文。采用滑动
-  窗口三段法保证上下文连贯、术语一致；阻断级质检确保段落、图片、表格、公式、代
-  码、引用均完整保留。默认输出 Markdown。
+  窗口翻译单元机制保证上下文连贯、术语一致；支持逐段、逐章节和 hybrid 章节翻译；
+  阻断级质检确保正文段落、图片、表格、公式、代码、引用均完整保留。默认从 References /
+  Bibliography 开始截断，参考文献及其后内容（如 Appendix）不进入最终译文。PDF 预处理采用
+  小文件整篇 Marker 超时回退、大文件分块 Marker 单块回退的组合策略，避免长 PDF 卡住。
+  整体流程采用平台中立的文件协议，可在 WorkBuddy、OpenClaw 或其他可读写文件并调用 LLM 的平台运行。
   触发词：翻译论文、翻译技术论文、翻译学术论文、翻译 arxiv、arxiv 翻译、论文汉化、
   paper translation、translate paper、英译中论文、paper to Chinese、学术翻译。
 location: user
@@ -29,10 +32,13 @@ entrypoint: scripts/run.py
 ## 核心原则
 
 1. **信达雅 + 忠实**：学术语气，禁止擅自摘要、省略、补全。
-2. **结构保真**：标题层级、图片、表格、公式（LaTeX）、代码块、引用编号 `[12]`、参考文献均原样保留。
-3. **滑动窗口三段法**：翻译时输入 `previous + current + next`，仅译 `current`，保证代词指代与术语一致。
-4. **术语一致**：内置 AI/ML 术语表 + 支持用户自定义 `glossary.json` 覆盖。
-5. **阻断级质检**：段落对齐、图片/表格/公式/代码/引用数量一致、长度比正常、无摘要性短语；任一不通过则终止并报告，除非用户明确 `--force` 跳过。
+2. **结构保真**：正文标题层级、图片、表格、公式（LaTeX）、代码块、引用编号 `[12]` 均原样保留。
+3. **References 截断**：从 `References` / `Bibliography` / `参考文献` 标题开始，后续所有内容（包括 `Appendix`、补充材料等）均不翻译、不进入最终译文。
+4. **滑动窗口翻译单元**：支持 `segment`、`section`、`hybrid` 三种模式；翻译时输入 `previous_zh_context + current_source + next_source`，仅译 `current_source`。
+5. **术语一致**：内置 AI/ML 术语表 + 支持用户自定义 `glossary.json` 覆盖。
+6. **阻断级质检**：正文段落对齐、图片/表格/公式/代码/引用数量一致、锁定块完整、References 后内容未混入译文、长度比正常、无摘要性短语；任一不通过则终止并报告，除非用户明确 `--force` 跳过。
+7. **定向返修**：QA 阻断时自动生成 `fix_prompts/`，帮助外部 LLM 执行器精准修复问题翻译单元。
+8. **平台中立**：核心脚本只依赖 Python 与文件系统；LLM 调用通过 `prompt -> zh.md` 文件协议完成，不绑定 WorkBuddy、OpenClaw 或特定 API。
 
 ## 输入
 
@@ -54,44 +60,64 @@ entrypoint: scripts/run.py
 ```
 输入 (PDF / URL)
   → fetch.py       下载（URL 情况）
-  → preprocess.py  PDF/HTML → 结构化 Markdown (Marker 优先，回退 pdfplumber+pymupdf)
-  → segment.py     分段 + 锚点化（锁定公式/代码/表格/图片/引用）
-  → translate.py   滑动窗口三段法翻译 + 术语表 + 断点续译
+  → preprocess.py  PDF/HTML → 结构化 Markdown (小 PDF 整篇 Marker；大 PDF 分块 Marker；超时/失败回退 pymupdf)
+  → segment.py     分段 + 锚点化（锁定公式/代码/图片；表格可锁定或翻译；References 后内容标记排除）
+  → translate.py   翻译单元生成 + previous_zh_context + 术语表 + 断点续译
   → postprocess.py 回贴锚点 + 中英排版规范化
-  → qa_report.py   阻断级质检
+  → qa_report.py   阻断级质检 + fix_prompts 返修提示
   → 输出
 ```
 
 ## 使用方式
 
-LLM 助手在满足触发条件后，按如下方式调用：
+任意宿主平台（例如 WorkBuddy、OpenClaw、本地脚本编排器）在满足触发条件后，都按如下方式调用。示例中的 `SKILL_DIR` 表示本 skill 所在目录，不要求固定为某个平台的专属路径。
 
 ```bash
 # 检测 Python
 which python3
 
+# 进入 skill 目录，或直接使用脚本绝对路径
+export SKILL_DIR=/path/to/technical-paper-translation
+cd "$SKILL_DIR"
+
 # 本地 PDF
-python3 ~/.workbuddy/skills/technical-paper-translation/scripts/run.py \
+python3 "$SKILL_DIR/scripts/run.py" \
   --input /path/to/paper.pdf \
   --outdir /path/to/output
 
 # URL 输入
-python3 ~/.workbuddy/skills/technical-paper-translation/scripts/run.py \
+python3 "$SKILL_DIR/scripts/run.py" \
   --input https://arxiv.org/abs/2403.xxxxx \
   --outdir /path/to/output
 
 # 可选参数
 --bilingual          同时输出双语对照 Markdown
 --glossary FILE      用户自定义术语表（覆盖内置）
+--unit-mode MODE     翻译单元：segment / section / hybrid（默认 hybrid）
+--hybrid-max-chars N hybrid 模式下单个翻译单元最大字符数（默认 12000）
+--table-mode MODE    表格策略：lock / translate（默认 lock）
+--pdf-engine MODE    PDF 解析：auto / marker / pymupdf / marker-chunked（默认 auto）
+--marker-timeout N   整篇 Marker 超时时间秒数（默认 900）
+--large-pdf-pages N  auto 模式下超过 N 页改用分块 Marker（默认 30）
+--pdf-chunk-pages N  分块 Marker 每块页数（默认 8）
+--chunk-timeout N    分块 Marker 单块超时时间秒数（默认 300）
+--chunk-fallback M   单块失败策略：pymupdf / skip / fail（默认 pymupdf）
 --force              跳过阻断级质检（仅在用户明确要求时使用）
---resume             断点续译
+--resume             断点续译；复用已有 source.md、segments.json 和已完成 PDF 分块
 ```
 
 ## LLM 翻译调用约定（重要）
 
-本 skill 的 `translate.py` 本身不直接调用 LLM API，而是把每段的"三段窗口 prompt"写入中间文件，由外层 Agent（即当前对话的 LLM）读取并逐段产出译文，再回写。这样可以复用当前 WorkBuddy 会话的模型，无需管理 API key。
+本 skill 的 `translate.py` 本身不直接调用 LLM API，也不假设运行在某个特定 Agent 产品中。它会把每个翻译单元的 prompt 写入 `prompts_per_segment/*.prompt.md`，由宿主平台或外部 LLM 执行器读取、调用模型，并将译文写回 `zh_per_segment/*.zh.md`。
 
-具体交互协议见 `prompts/translate_segment.md`。
+因此，只要平台具备以下能力即可接入：
+
+1. 执行 `python3 scripts/run.py --stage prepare ...` 生成任务。
+2. 读取 `INDEX.md` 和 `prompts_per_segment/*.prompt.md`。
+3. 对每个 prompt 调用任意 LLM，并把纯译文写入对应的 `zh_per_segment/<unit_id>.zh.md`。
+4. 执行 `python3 scripts/run.py --stage finalize --outdir ...` 组装、回贴锁定块并质检。
+
+如果宿主平台支持 system/user 角色，请把 prompt 文件中的 `# SYSTEM` 用作 system prompt、`# USER` 用作 user message；如果不支持 system 角色，可把 `# SYSTEM` 内容放到 user message 开头。
 
 ## 依赖
 
@@ -100,5 +126,13 @@ python3 ~/.workbuddy/skills/technical-paper-translation/scripts/run.py \
 - Marker 会在首次 PDF 解析时下载 ~1–2GB 模型权重
 
 ## 版本
+
+v0.2.3（2026-04-26）—— PDF 预处理采用组合策略：小 PDF 整篇 Marker 超时回退，大 PDF 分块 Marker 单块回退，并增强 `--resume` 复用已有预处理/分段产物。
+
+v0.2.2（2026-04-26）—— 将 skill 运行协议平台中立化，移除 WorkBuddy 专属假设，补充 WorkBuddy / OpenClaw / 通用 LLM 执行器接入说明。
+
+v0.2.1（2026-04-26）—— 从 References / Bibliography 开始截断，参考文献及其后内容（如 Appendix）不进入最终译文。
+
+v0.2.0（2026-04-26）—— 支持 hybrid/section 翻译单元、上一单元中文上下文、表格策略、B9/B10 质检与自动修复 prompt。
 
 v0.1.0（2026-04-25）—— 初始版本，v1。
