@@ -7,13 +7,13 @@
 解压或克隆到任意目录，例如：
 
 ```bash
-/path/to/technical-paper-translation/
+/path/to/QiQ-tech-paper-trans/
 ```
 
 之后通过脚本绝对路径或进入目录后运行：
 
 ```bash
-cd /path/to/technical-paper-translation
+cd /path/to/QiQ-tech-paper-trans
 python3 scripts/run.py --help
 ```
 
@@ -23,13 +23,13 @@ python3 scripts/run.py --help
 
 ```bash
 # WorkBuddy / CodeBuddy 示例
-~/.workbuddy/skills/technical-paper-translation/
+~/.workbuddy/skills/QiQ-tech-paper-trans/
 
 # 项目级 WorkBuddy / CodeBuddy 示例
-<project>/.workbuddy/skills/technical-paper-translation/
+<project>/.workbuddy/skills/QiQ-tech-paper-trans/
 
 # OpenClaw 或其他平台
-<platform-skill-dir>/technical-paper-translation/
+<platform-skill-dir>/QiQ-tech-paper-trans/
 ```
 
 平台只需要把 `entrypoint` 指向 `scripts/run.py`，并按照 `SKILL.md` 中的文件协议执行 prepare、翻译写回、finalize 三步。
@@ -37,7 +37,7 @@ python3 scripts/run.py --help
 ## 依赖安装
 
 ```bash
-cd /path/to/technical-paper-translation
+cd /path/to/QiQ-tech-paper-trans
 python3 -m pip install -r requirements.txt
 ```
 
@@ -53,4 +53,4 @@ python3 scripts/run.py --help
 
 ## 版本
 
-v0.2.2
+v0.2.6

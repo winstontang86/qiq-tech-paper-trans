@@ -31,7 +31,7 @@ def _download(url: str, dst: Path, timeout: int = 60) -> bool:
     import requests
     try:
         r = requests.get(url, timeout=timeout, stream=True,
-                         headers={"User-Agent": "technical-paper-translation/0.1"})
+                         headers={"User-Agent": "QiQ-tech-paper-trans/0.1"})
         r.raise_for_status()
         dst.parent.mkdir(parents=True, exist_ok=True)
         with open(dst, "wb") as f:
