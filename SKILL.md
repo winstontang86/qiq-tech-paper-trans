@@ -109,6 +109,7 @@ python3 "$SKILL_DIR/scripts/run.py" \
 --chunk-timeout N    分块 Marker 单块基础超时时间秒数（默认 900；OCR 日志仍活跃时自动宽限到最多 3 倍）
 --chunk-fallback M   单块失败策略：pymupdf / skip / fail（默认 pymupdf）
 --chunk-concurrency N 分块 Marker 并行 worker 数（默认 1；每个 worker 加载 ~1-2GB 模型，建议 2、4）
+--progress-interval N Marker 与分块 PDF 预处理的心跳输出间隔秒数（默认 30；用于大 PDF 长时间运行时确认仍在执行）
 --retry-fallback     --resume 时，重跑之前 fallback 到 pymupdf/skip/failed 的分块
 --table-strategy MODE 表格处理策略：image / markdown（默认 image）
                         image：用 pdfplumber 检测 PDF 中的表格区域并用 pymupdf 截图为 PNG，
@@ -116,7 +117,8 @@ python3 "$SKILL_DIR/scripts/run.py" \
                         翻译 / Word 导出都不会破表。
                         markdown：保留 Marker 抽出的 Markdown 表格，再由 --table-mode 决定锁定或翻译。
 --force              跳过阻断级质检（仅在用户明确要求时使用）
---resume             断点续译；复用已有 source.md、segments.json 和已完成 PDF 分块```
+--resume             断点续译；复用已有 source.md、segments.json 和已完成 PDF 分块
+```
 
 ## LLM 翻译调用约定（重要）
 

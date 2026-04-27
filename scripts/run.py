@@ -133,6 +133,7 @@ def stage_prepare(args) -> Path:
             chunk_concurrency=args.chunk_concurrency,
             retry_fallback=args.retry_fallback,
             table_strategy=args.table_strategy,
+            progress_interval=args.progress_interval,
         )
         print(f"[run] preprocessed: {source_md}", flush=True)
 
@@ -295,6 +296,8 @@ def main():
                     help="parallel workers for chunked marker (each worker loads ~1-2GB model; 2 is a safe default on 16GB machines)")
     ap.add_argument("--retry-fallback", action="store_true",
                     help="with --resume, rerun chunks whose previous engine was pymupdf/skip/failed")
+    ap.add_argument("--progress-interval", type=int, default=30,
+                    help="seconds between progress heartbeats during Marker and chunked PDF preprocessing")
     ap.add_argument("--unit-mode", choices=["segment", "section", "hybrid"], default="hybrid",
                     help="translation unit: segment is safest, section is fastest, hybrid balances both")
     ap.add_argument("--hybrid-max-chars", type=int, default=12000,
