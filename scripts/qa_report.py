@@ -10,6 +10,7 @@ import hashlib
 import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+from urllib.parse import unquote
 
 
 SUMMARY_PHRASES = [
@@ -34,6 +35,7 @@ TABLE_RE = re.compile(
     re.MULTILINE,
 )
 IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\([^)\n]+\)")
+IMAGE_TARGET_RE = re.compile(r"!\[[^\]\n]*\]\(([^)\n]+)\)")
 CITATION_RE = re.compile(r"\[\d+(?:,\s*\d+)*\]|\([A-Z][\w\-]+(?:\s+et\s+al\.?)?,?\s+\d{4}[a-z]?\)")
 PLACEHOLDER_RE = re.compile(r"⟦(CODE|FORMULA|INLINE_FORMULA|TABLE|IMAGE)_(\d{4})⟧")
 
@@ -53,6 +55,67 @@ def _restore_placeholders(text: str, mapping: Dict[str, str]) -> str:
     for ph, raw in mapping.items():
         text = text.replace(ph, raw)
     return text
+
+
+def _is_external_image_path(path: str) -> bool:
+    return bool(re.match(r"^(https?:|data:|/|#)", path.strip()))
+
+
+def _split_markdown_image_target(raw: str) -> tuple[str, str]:
+    raw = raw.strip()
+    if raw.startswith("<"):
+        end = raw.find(">")
+        if end > 0:
+            return raw[1:end].strip(), raw[end + 1:].strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return raw, ""
+
+
+def _normalize_image_path_for_compare(path: str, translated_md: Path) -> str:
+    if _is_external_image_path(path):
+        return path.strip()
+    normalized = path.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    stem_assets = f"{translated_md.stem.removesuffix('.zh')}.assets"
+    for prefix in (stem_assets, "assets"):
+        if normalized == prefix:
+            return "assets"
+        if normalized.startswith(prefix + "/"):
+            return "assets/" + normalized[len(prefix) + 1:]
+    return normalized
+
+
+def _image_block_equivalent(raw: str, tgt: str, translated_md: Path) -> bool:
+    raw_targets = IMAGE_TARGET_RE.findall(raw)
+    if not raw_targets:
+        return raw in tgt
+    tgt_targets = {
+        _normalize_image_path_for_compare(_split_markdown_image_target(target)[0], translated_md)
+        for target in IMAGE_TARGET_RE.findall(tgt)
+    }
+    for target in raw_targets:
+        path, _title = _split_markdown_image_target(target)
+        if _normalize_image_path_for_compare(path, translated_md) not in tgt_targets:
+            return False
+    return True
+
+
+def _missing_local_images(translated_md: Path) -> list[dict[str, str]]:
+    text = translated_md.read_text(encoding="utf-8")
+    root = translated_md.parent
+    missing: list[dict[str, str]] = []
+    for target in IMAGE_TARGET_RE.findall(text):
+        path, _title = _split_markdown_image_target(target)
+        if _is_external_image_path(path):
+            continue
+        normalized = _normalize_image_path_for_compare(path, translated_md)
+        resolved = (root / unquote(normalized)).resolve()
+        if not resolved.exists():
+            missing.append({"path": normalized, "resolved": str(resolved)})
+    return missing
 
 
 def count_elements(text: str) -> Dict[str, int]:
@@ -196,7 +259,12 @@ def check(source_md: Path, translated_md: Path, segments_path: Path,
         remaining_placeholders = sorted(set(m.group(0) for m in PLACEHOLDER_RE.finditer(tgt)))
         missing_locked = []
         for ph, raw in active_locked_blocks.items():
-            if raw not in tgt:
+            is_image_block = ph.startswith("⟦IMAGE_")
+            if is_image_block:
+                exists = _image_block_equivalent(raw, tgt, translated_md)
+            else:
+                exists = raw in tgt
+            if not exists:
                 missing_locked.append({"placeholder": ph, "hash": _sha256(raw)})
         if remaining_placeholders or missing_locked:
             blockers.append({
@@ -218,6 +286,16 @@ def check(source_md: Path, translated_md: Path, segments_path: Path,
                 "id": "B10", "title": "References 后内容误入译文",
                 "detail": f"共 {len(leaked)} 个已排除段仍出现在最终译文中",
                 "segments": leaked[:20],
+            })
+
+    # B11 本地图片文件存在性：图片 Markdown 数量足够但文件缺失时，最终渲染仍会破图。
+    if "B11" not in skip:
+        missing_images = _missing_local_images(translated_md)
+        if missing_images:
+            blockers.append({
+                "id": "B11", "title": "本地图片文件缺失",
+                "detail": f"共 {len(missing_images)} 个本地图片链接无法解析到文件",
+                "images": missing_images[:20],
             })
 
     # W4 疑似未翻译段（警告）
@@ -340,6 +418,10 @@ def write_report(summary: Dict[str, Any], out_path: Path) -> Path:
                 lines.append(f"- 未回贴占位符: {', '.join(b['placeholders'])}")
             if "locked_hashes" in b and b["locked_hashes"]:
                 lines.append(f"- 缺失锁定块哈希: {', '.join(b['locked_hashes'])}")
+            if "images" in b and b["images"]:
+                lines.append("- 缺失图片:")
+                for img in b["images"]:
+                    lines.append(f"  - `{img['path']}` -> `{img['resolved']}`")
             lines.append("")
 
     if summary["warnings"]:

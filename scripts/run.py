@@ -49,25 +49,102 @@ from qa_report import check as qa_check, write_report as qa_write, write_fix_pro
 SKILL_ROOT = Path(__file__).parent.parent
 
 
+import json
 import re
 import shutil
+from urllib.parse import unquote
 
-_IMG_RE = re.compile(r"(!\[[^\]]*\]\()([^)\n]+)(\))")
+_IMG_RE = re.compile(r"(!\[[^\]\n]*\]\()([^)\n]+)(\))")
+_IMAGE_TARGET_RE = re.compile(r"!\[[^\]\n]*\]\(([^)\n]+)\)")
 
 
-def _rewrite_final_image_paths(md_text: str, new_prefix: str) -> str:
-    """将文中的 `assets/...` 相对路径改写为 `<new_prefix>/...`。保留绝对路径和 http(s)/data 链接。"""
+def _is_external_image_path(path: str) -> bool:
+    return bool(re.match(r"^(https?:|data:|/|#)", path.strip()))
+
+
+def _split_markdown_image_target(raw: str) -> tuple[str, str, bool]:
+    """拆分 Markdown 图片 target，保留可选 title。返回 path、title、path 是否由 <> 包裹。"""
+    raw = raw.strip()
+    if raw.startswith("<"):
+        end = raw.find(">")
+        if end > 0:
+            return raw[1:end].strip(), raw[end + 1:].strip(), True
+    parts = raw.split(maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip(), False
+    return raw, "", False
+
+
+def _format_markdown_image_target(path: str, title: str, wrapped: bool) -> str:
+    path_part = f"<{path}>" if wrapped or " " in path else path
+    return f"{path_part} {title}".rstrip()
+
+
+def _normalize_asset_path(path: str, primary_prefix: str, mirror_prefix: str | None = None) -> str:
+    """把 `<stem>.assets/...`、`./assets/...` 等本地图片路径归一到 primary_prefix。"""
+    if _is_external_image_path(path):
+        return path
+
+    normalized = path.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+
+    prefixes = [p for p in (mirror_prefix, primary_prefix) if p]
+    for prefix in prefixes:
+        clean_prefix = prefix.replace("\\", "/").strip("/")
+        if normalized == clean_prefix:
+            return primary_prefix
+        if normalized.startswith(clean_prefix + "/"):
+            return f"{primary_prefix}/{normalized[len(clean_prefix) + 1:]}"
+    return normalized
+
+
+def _normalize_final_image_paths(md_text: str, primary_prefix: str = "assets",
+                                 mirror_prefix: str | None = None) -> str:
+    """最终 Markdown 默认使用 `assets/...`，兼容 WorkBuddy/常见 Markdown 预览器。"""
     def repl(m: re.Match[str]) -> str:
-        head, raw, tail = m.group(1), m.group(2).strip(), m.group(3)
-        if re.match(r"^(https?:|data:|/|#)", raw):
+        head, raw, tail = m.group(1), m.group(2), m.group(3)
+        path, title, wrapped = _split_markdown_image_target(raw)
+        new_path = _normalize_asset_path(path, primary_prefix, mirror_prefix)
+        if new_path == path:
             return m.group(0)
-        raw = raw.removeprefix("./")
-        if raw.startswith("assets/"):
-            raw = raw[len("assets/"):]
-            return f"{head}{new_prefix}/{raw}{tail}"
-        return m.group(0)
+        return f"{head}{_format_markdown_image_target(new_path, title, wrapped)}{tail}"
 
     return _IMG_RE.sub(repl, md_text)
+
+
+def _find_missing_local_images(md_path: Path) -> list[dict[str, str]]:
+    """检查 Markdown 中本地图片链接是否能按 md 所在目录解析到真实文件。"""
+    text = md_path.read_text(encoding="utf-8")
+    root = md_path.parent
+    missing: list[dict[str, str]] = []
+    for raw in _IMAGE_TARGET_RE.findall(text):
+        path, _title, _wrapped = _split_markdown_image_target(raw)
+        if _is_external_image_path(path):
+            continue
+        normalized = _normalize_asset_path(path, "assets")
+        fs_path = (root / unquote(normalized)).resolve()
+        if not fs_path.exists():
+            missing.append({
+                "raw": raw,
+                "path": normalized,
+                "resolved": str(fs_path),
+            })
+    return missing
+
+
+def _write_image_check_report(final_md: Path) -> list[dict[str, str]]:
+    missing = _find_missing_local_images(final_md)
+    report_path = final_md.with_suffix(".images.json")
+    report_path.write_text(
+        json.dumps({
+            "translated": str(final_md),
+            "missing_count": len(missing),
+            "missing": missing,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return missing
 
 
 def _try_export_docx(md_path: Path, docx_path: Path, resource_dirs: list[Path]) -> bool:
@@ -194,8 +271,8 @@ def stage_finalize(args) -> None:
     postprocess(raw, locked_path, final_md)
     print(f"[run] postprocessed: {final_md}")
 
-    # 同步复制一份 assets 为 <stem>.assets/，并把译文里的 assets/xxx 改写为 <stem>.assets/xxx
-    # 这样用户单独拷走 <stem>.zh.md 和 <stem>.assets/、或以其为源转 docx，都能正确找到图片。
+    # 最终 Markdown 优先引用 outdir/assets/，这是多数 Markdown 预览器和 WorkBuddy 最稳定的相对路径。
+    # 另同步复制一份 <stem>.assets/，便于用户打包搬运；若历史译文中已有 <stem>.assets/ 链接，会归一回 assets/。
     src_assets = outdir / "assets"
     final_assets = outdir / f"{stem}.assets"
     if src_assets.exists():
@@ -205,10 +282,16 @@ def stage_finalize(args) -> None:
         print(f"[run] assets mirrored: {final_assets}")
 
         md_text = final_md.read_text(encoding="utf-8")
-        new_text = _rewrite_final_image_paths(md_text, f"{stem}.assets")
+        new_text = _normalize_final_image_paths(md_text, "assets", f"{stem}.assets")
         if new_text != md_text:
             final_md.write_text(new_text, encoding="utf-8")
-            print(f"[run] rewrote image links in {final_md.name}")
+            print(f"[run] normalized image links in {final_md.name}")
+
+    missing_images = _write_image_check_report(final_md)
+    if missing_images:
+        print(f"[run] WARNING: {len(missing_images)} local image link(s) missing; see {final_md.with_suffix('.images.json')}", file=sys.stderr)
+    else:
+        print(f"[run] image links verified: {final_md.with_suffix('.images.json')}")
 
     skip = [s.strip() for s in (args.skip_checks or "").split(",") if s.strip()]
     summary, blockers = qa_check(source_md, final_md, segments_path, skip_checks=skip)
@@ -248,10 +331,10 @@ def stage_finalize(args) -> None:
             bilingual_lines.append("")
         bilingual_path = outdir / f"{stem}.bilingual.md"
         bilingual_path.write_text("\n".join(bilingual_lines), encoding="utf-8")
-        # 双语文件同样应该能渲染图片：将 assets/ 改写为 <stem>.assets/
-        if (outdir / f"{stem}.assets").exists():
+        # 双语文件同样归一为 assets/ 主路径，便于本地预览；<stem>.assets/ 仅作为便携镜像副本。
+        if (outdir / "assets").exists():
             bi_text = bilingual_path.read_text(encoding="utf-8")
-            bi_new = _rewrite_final_image_paths(bi_text, f"{stem}.assets")
+            bi_new = _normalize_final_image_paths(bi_text, "assets", f"{stem}.assets")
             if bi_new != bi_text:
                 bilingual_path.write_text(bi_new, encoding="utf-8")
         print(f"[run] bilingual: {bilingual_path}")
