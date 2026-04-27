@@ -1,5 +1,5 @@
 ---
-name: QiQ-tech-paper-trans
+name: qiq-tech-paper-trans
 version: 0.2.6
 description: |
   英文技术论文翻译为中文（信达雅学术风格）。支持本地 PDF 文件与 URL 输入（arXiv
@@ -18,7 +18,7 @@ description: |
 location: user
 entrypoint: scripts/run.py
 ---
-# QiQ-tech-paper-trans
+# qiq-tech-paper-trans
 
 英文技术论文翻译为中文（信达雅学术风格）的 skill。
 
@@ -82,7 +82,7 @@ entrypoint: scripts/run.py
 which python3
 
 # 进入 skill 目录，或直接使用脚本绝对路径
-export SKILL_DIR=/path/to/QiQ-tech-paper-trans
+export SKILL_DIR=/path/to/qiq-tech-paper-trans
 cd "$SKILL_DIR"
 
 # 本地 PDF

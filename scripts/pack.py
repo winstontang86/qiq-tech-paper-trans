@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 SKILL_ROOT = Path(__file__).parent.parent
-SKILL_NAME = "QiQ-tech-paper-trans"
+SKILL_NAME = "qiq-tech-paper-trans"
 
 
 EXCLUDE_DIRS = {"__pycache__", ".git", ".venv", "venv", "dist",
@@ -60,7 +60,7 @@ def pack(out_dir: Path) -> Path:
                 fp = Path(root) / f
                 if should_skip(fp, SKILL_ROOT):
                     continue
-            # In-zip path: QiQ-tech-paper-trans/<relative>
+            # In-zip path: qiq-tech-paper-trans/<relative>
                 rel = fp.relative_to(SKILL_ROOT)
                 arcname = f"{SKILL_NAME}/{rel.as_posix()}"
                 zf.write(fp, arcname)
