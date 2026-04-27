@@ -23,6 +23,18 @@ import sys
 import argparse
 from pathlib import Path
 
+
+def _enable_line_buffered_output() -> None:
+    """让长时间运行的 prepare 阶段及时向宿主刷新进度，避免被误判为无响应。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+
+_enable_line_buffered_output()
+
 # 允许作为 `python3 run.py` 直接运行
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -99,8 +111,13 @@ def stage_prepare(args) -> Path:
     print(f"[run] fetched: kind={kind} path={local_path}")
 
     source_md = outdir / "source.md"
-    if args.resume and source_md.exists() and source_md.stat().st_size > 0:
-        print(f"[run] resume: source.md exists; skip preprocess: {source_md}")
+    partial_preprocess = (outdir / "preprocess_chunks" / "progress.json").exists()
+    preprocess_resume = args.resume or (partial_preprocess and not source_md.exists())
+    if preprocess_resume and not args.resume:
+        print("[run] detected partial preprocess state; auto-enable preprocess resume", flush=True)
+
+    if preprocess_resume and source_md.exists() and source_md.stat().st_size > 0:
+        print(f"[run] resume: source.md exists; skip preprocess: {source_md}", flush=True)
     else:
         source_md = preprocess(
             local_path,
@@ -112,12 +129,12 @@ def stage_prepare(args) -> Path:
             pdf_chunk_pages=args.pdf_chunk_pages,
             chunk_timeout=args.chunk_timeout,
             chunk_fallback=args.chunk_fallback,
-            resume=args.resume,
+            resume=preprocess_resume,
             chunk_concurrency=args.chunk_concurrency,
             retry_fallback=args.retry_fallback,
             table_strategy=args.table_strategy,
         )
-        print(f"[run] preprocessed: {source_md}")
+        print(f"[run] preprocessed: {source_md}", flush=True)
 
     segments_path = outdir / "segments.json"
     locked_path = outdir / "locked_blocks.json"
@@ -264,14 +281,14 @@ def main():
                     help="(prepare) reuse existing source.md, segments.json and completed chunk outputs when possible")
     ap.add_argument("--pdf-engine", choices=["auto", "marker", "pymupdf", "marker-chunked"], default="auto",
                     help="PDF preprocess engine: auto uses full Marker for small PDFs and chunked Marker for large PDFs")
-    ap.add_argument("--marker-timeout", type=int, default=900,
+    ap.add_argument("--marker-timeout", type=int, default=1800,
                     help="timeout seconds for full-PDF Marker in auto/marker mode")
     ap.add_argument("--large-pdf-pages", type=int, default=20,
                     help="auto mode switches to chunked Marker when PDF pages exceed this threshold")
-    ap.add_argument("--pdf-chunk-pages", type=int, default=12,
-                    help="pages per chunk for marker-chunked mode")
-    ap.add_argument("--chunk-timeout", type=int, default=300,
-                    help="timeout seconds for each Marker chunk")
+    ap.add_argument("--pdf-chunk-pages", type=int, default=6,
+                    help="pages per chunk for marker-chunked mode; smaller chunks reduce long OCR idle/session timeout risk")
+    ap.add_argument("--chunk-timeout", type=int, default=900,
+                    help="base timeout seconds for each Marker chunk; active OCR logs may extend up to 3x")
     ap.add_argument("--chunk-fallback", choices=["pymupdf", "skip", "fail"], default="pymupdf",
                     help="fallback policy when a Marker chunk fails or times out")
     ap.add_argument("--chunk-concurrency", type=int, default=1,

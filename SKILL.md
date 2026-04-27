@@ -103,10 +103,10 @@ python3 "$SKILL_DIR/scripts/run.py" \
 --hybrid-max-chars N hybrid 模式下单个翻译单元最大字符数（默认 12000）
 --table-mode MODE    表格策略：lock / translate（默认 lock）
 --pdf-engine MODE    PDF 解析：auto / marker / pymupdf / marker-chunked（默认 auto）
---marker-timeout N   整篇 Marker 超时时间秒数（默认 900）
+--marker-timeout N   整篇 Marker 超时时间秒数（默认 1800）
 --large-pdf-pages N  auto 模式下超过 N 页改用分块 Marker（默认 20）
---pdf-chunk-pages N  分块 Marker 每块页数（默认 12）
---chunk-timeout N    分块 Marker 单块超时时间秒数（默认 300）
+--pdf-chunk-pages N  分块 Marker 每块页数（默认 6；页数越小，单块 OCR 越快、越不容易被宿主超时中断）
+--chunk-timeout N    分块 Marker 单块基础超时时间秒数（默认 900；OCR 日志仍活跃时自动宽限到最多 3 倍）
 --chunk-fallback M   单块失败策略：pymupdf / skip / fail（默认 pymupdf）
 --chunk-concurrency N 分块 Marker 并行 worker 数（默认 1；每个 worker 加载 ~1-2GB 模型，建议 2、4）
 --retry-fallback     --resume 时，重跑之前 fallback 到 pymupdf/skip/failed 的分块

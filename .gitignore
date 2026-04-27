@@ -1,1 +1,35 @@
-*.pyc
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Build / package outputs
+dist/
+build/
+*.egg-info/
+
+# qiq-tech-paper-trans runtime artifacts
+prompts_per_segment/
+zh_per_segment/
+preprocess_chunks/
+fix_prompts/
+translated_raw.md
+masked.md
+source.md
+segments.json
+locked_blocks.json
+INDEX.md
+waves.json
+status.json
+*.qa.md
+*.bilingual.md
+*.zh.docx
+*.zh.md
+*.assets/

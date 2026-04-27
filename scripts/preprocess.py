@@ -24,11 +24,24 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+
+def _enable_line_buffered_output() -> None:
+    """让长时间运行的 OCR/Marker 进度及时输出到宿主，避免被误判为无响应。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+
+_enable_line_buffered_output()
 
 from table_extractor import (
     TableImage,
@@ -94,6 +107,53 @@ def _clean_text(text: str) -> str:
     text = _dehyphenate(text)
     text = _strip_repeating_headers(text)
     return text.strip() + "\n"
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _tail_file_text(path: Path, max_bytes: int = 4096) -> str:
+    if not path.exists() or path.stat().st_size == 0:
+        return ""
+    with path.open("rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - max_bytes))
+        return f.read().decode("utf-8", errors="ignore")
+
+
+def _terminate_process_tree(proc: subprocess.Popen, log_fp) -> None:
+    """尽量优雅地终止 Marker 子进程组，避免超时 kill 后残留 semaphore/worker。"""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=20)
+        log_fp.write(f"[{_now_iso()}] marker parent terminated child gracefully\n")
+        log_fp.flush()
+    except Exception as e:
+        log_fp.write(f"[{_now_iso()}] marker parent graceful terminate failed: {e}; killing child\n")
+        log_fp.flush()
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
 
 
 def _pdf_page_count(pdf_path: Path) -> int:
@@ -167,8 +227,12 @@ def _write_marker_output(pdf_path: Path, outdir: Path) -> Path:
         ) from e
 
     outdir.mkdir(parents=True, exist_ok=True)
+    print(f"[preprocess] marker worker start pdf={pdf_path.name}", flush=True)
+    print("[preprocess] marker worker loading models; first run may download Hugging Face artifacts and take several minutes", flush=True)
     converter = PdfConverter(artifact_dict=create_model_dict())
+    print("[preprocess] marker worker models ready", flush=True)
     rendered = converter(str(pdf_path))
+    print("[preprocess] marker worker rendered pdf", flush=True)
     text, _, images = text_from_rendered(rendered)
 
     assets_dir = outdir / "assets"
@@ -183,16 +247,18 @@ def _write_marker_output(pdf_path: Path, outdir: Path) -> Path:
                 elif isinstance(img, (bytes, bytearray)):
                     img_path.write_bytes(bytes(img))
             except Exception as e:
-                print(f"[preprocess] save image failed: {name} -> {e}", file=sys.stderr)
+                print(f"[preprocess] save image failed: {name} -> {e}", file=sys.stderr, flush=True)
 
     md_path = outdir / "source.md"
     md_path.write_text(_clean_text(text), encoding="utf-8")
+    print(f"[preprocess] marker worker wrote {md_path}", flush=True)
     return md_path
 
 
 def _run_marker_subprocess(pdf_path: Path, workdir: Path, timeout: int, label: str) -> Path:
-    """用子进程运行 Marker，超时后可安全终止。"""
+    """用子进程运行 Marker，超时后可安全终止，并把日志持久化到 marker.log。"""
     workdir.mkdir(parents=True, exist_ok=True)
+    log_path = workdir / "marker.log"
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -202,32 +268,104 @@ def _run_marker_subprocess(pdf_path: Path, workdir: Path, timeout: int, label: s
         "--outdir",
         str(workdir),
     ]
-    print(f"[preprocess] marker start label={label} timeout={timeout}s")
-    proc = subprocess.Popen(cmd)
-    started = time.monotonic()
-    next_heartbeat = started + 30
+    print(f"[preprocess] marker start label={label} timeout={timeout}s log={log_path}", flush=True)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
 
-    while True:
-        rc = proc.poll()
-        if rc is not None:
-            if rc != 0:
-                raise RuntimeError(f"marker failed label={label} exit={rc}")
-            md_path = workdir / "source.md"
-            if not md_path.exists() or md_path.stat().st_size == 0:
-                raise RuntimeError(f"marker produced empty output label={label}")
-            print(f"[preprocess] marker done label={label}")
-            return md_path
+    with log_path.open("a", encoding="utf-8") as log_fp:
+        log_fp.write(f"\n[{_now_iso()}] marker parent start label={label} timeout={timeout}s cmd={' '.join(cmd)}\n")
+        log_fp.flush()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=(os.name == "posix"),
+        )
+        started = time.monotonic()
+        heartbeat_interval = 10
+        next_heartbeat = started + heartbeat_interval
+        last_log_size = log_path.stat().st_size if log_path.exists() else 0
+        last_log_activity = started
+        max_timeout = timeout * 3 if timeout > 0 else 0
 
-        elapsed = time.monotonic() - started
-        if timeout > 0 and elapsed > timeout:
-            proc.kill()
-            proc.wait()
-            raise TimeoutError(f"marker timeout label={label} after {timeout}s")
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                log_fp.write(f"[{_now_iso()}] marker parent exit label={label} rc={rc}\n")
+                log_fp.flush()
+                if rc != 0:
+                    raise RuntimeError(f"marker failed label={label} exit={rc}; see {log_path}")
+                md_path = workdir / "source.md"
+                if not md_path.exists() or md_path.stat().st_size == 0:
+                    raise RuntimeError(f"marker produced empty output label={label}; see {log_path}")
+                print(f"[preprocess] marker done label={label} log={log_path}")
+                return md_path
 
-        if time.monotonic() >= next_heartbeat:
-            print(f"[preprocess] marker running label={label} elapsed={int(elapsed)}s timeout={timeout}s")
-            next_heartbeat += 30
-        time.sleep(1)
+            elapsed = time.monotonic() - started
+            now = time.monotonic()
+            current_log_size = log_path.stat().st_size if log_path.exists() else 0
+            if current_log_size > last_log_size:
+                last_log_size = current_log_size
+                last_log_activity = now
+
+            if timeout > 0 and elapsed > timeout:
+                idle_for = now - last_log_activity
+                if elapsed <= max_timeout and idle_for < 90:
+                    if now >= next_heartbeat:
+                        msg = (
+                            f"[preprocess] marker still active label={label} elapsed={int(elapsed)}s "
+                            f"base_timeout={timeout}s max_timeout={max_timeout}s idle_for={int(idle_for)}s log={log_path}"
+                        )
+                        print(msg, flush=True)
+                        _write_json(workdir / "heartbeat.json", {
+                            "updated_at": _now_iso(),
+                            "label": label,
+                            "elapsed_seconds": int(elapsed),
+                            "timeout_seconds": timeout,
+                            "max_timeout_seconds": max_timeout,
+                            "idle_for_seconds": int(idle_for),
+                            "hint": "marker_still_active_after_base_timeout",
+                            "log_path": str(log_path),
+                        })
+                        log_fp.write(f"[{_now_iso()}] {msg}\n")
+                        log_fp.flush()
+                        next_heartbeat += heartbeat_interval
+                    time.sleep(1)
+                    continue
+                _terminate_process_tree(proc, log_fp)
+                log_fp.write(
+                    f"[{_now_iso()}] marker parent timeout label={label} after {int(elapsed)}s "
+                    f"base_timeout={timeout}s max_timeout={max_timeout}s idle_for={int(idle_for)}s\n"
+                )
+                log_fp.flush()
+                raise TimeoutError(f"marker timeout label={label} after {int(elapsed)}s; see {log_path}")
+
+            if now >= next_heartbeat:
+                tail = _tail_file_text(log_path)
+                hint = ""
+                tail_lower = tail.lower()
+                if "recognizing text" in tail_lower:
+                    hint = " hint=ocr_text_recognition"
+                elif "recognizing layout" in tail_lower:
+                    hint = " hint=layout_recognition"
+                elif any(k in tail_lower for k in ["download", "huggingface", "fetching", "xet", "model"]):
+                    hint = " hint=model_init_or_download"
+                msg = f"[preprocess] marker running label={label} elapsed={int(elapsed)}s timeout={timeout}s log={log_path}{hint}"
+                print(msg, flush=True)
+                _write_json(workdir / "heartbeat.json", {
+                    "updated_at": _now_iso(),
+                    "label": label,
+                    "elapsed_seconds": int(elapsed),
+                    "timeout_seconds": timeout,
+                    "hint": hint.strip() or None,
+                    "log_path": str(log_path),
+                })
+                log_fp.write(f"[{_now_iso()}] {msg}\n")
+                log_fp.flush()
+                next_heartbeat += heartbeat_interval
+            time.sleep(1)
 
 
 def preprocess_pdf_marker(
@@ -356,9 +494,133 @@ def _read_chunk_status(chunk_dir: Path) -> dict:
 
 def _write_chunk_status(chunk_dir: Path, status: dict) -> None:
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    (chunk_dir / "status.json").write_text(
-        json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    payload = dict(status)
+    source_md = chunk_dir / "source.md"
+    payload["updated_at"] = _now_iso()
+    payload["source_md_exists"] = source_md.exists()
+    payload["source_md_size"] = source_md.stat().st_size if source_md.exists() else 0
+    payload["chunk_pdf_exists"] = any(p.is_file() and p.suffix.lower() == ".pdf" for p in chunk_dir.iterdir())
+    _write_json(chunk_dir / "status.json", payload)
+
+
+def _build_progress_payload(plan: list[dict], todo_ids: list[str] | None = None) -> dict:
+    chunks = []
+    completed = 0
+    failed = 0
+    running = 0
+    pending = 0
+    for item in plan:
+        chunk_dir = item["chunk_dir"]
+        status = _read_chunk_status(chunk_dir)
+        source_md = chunk_dir / "source.md"
+        has_source_md = source_md.exists() and source_md.stat().st_size > 0
+        state = "completed" if has_source_md else (status.get("state") or "pending")
+        engine = status.get("engine") or ("marker" if has_source_md else None)
+        if state == "completed":
+            completed += 1
+        elif state == "failed":
+            failed += 1
+        elif state == "running":
+            running += 1
+        else:
+            pending += 1
+        chunks.append({
+            "chunk_id": item["chunk_id"],
+            "pages": [item["start"], item["end"]],
+            "state": state,
+            "engine": engine,
+            "error": status.get("error"),
+            "updated_at": status.get("updated_at"),
+        })
+    return {
+        "updated_at": _now_iso(),
+        "total": len(plan),
+        "todo": todo_ids or [],
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "pending": pending,
+        "chunks": chunks,
+    }
+
+
+def _write_progress_file(chunks_dir: Path, plan: list[dict], todo_ids: list[str] | None = None) -> None:
+    _write_json(chunks_dir / "progress.json", _build_progress_payload(plan, todo_ids))
+
+
+def _load_resume_plan_from_progress(chunks_dir: Path, total_pages: int) -> list[dict] | None:
+    progress_path = chunks_dir / "progress.json"
+    if not progress_path.exists():
+        return None
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    raw_chunks = progress.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        return None
+
+    plan: list[dict] = []
+    for raw in raw_chunks:
+        pages = raw.get("pages")
+        chunk_id = raw.get("chunk_id")
+        if (
+            not chunk_id
+            or not isinstance(pages, list)
+            or len(pages) != 2
+            or not isinstance(pages[0], int)
+            or not isinstance(pages[1], int)
+        ):
+            return None
+        start, end = pages
+        if start < 1 or end < start or end > total_pages:
+            return None
+        chunk_dir = chunks_dir / chunk_id
+        plan.append({
+            "chunk_id": chunk_id,
+            "start": start,
+            "end": end,
+            "chunk_dir": chunk_dir,
+            "chunk_pdf": chunk_dir / f"{chunk_id}.pdf",
+        })
+
+    covered: set[int] = set()
+    for item in plan:
+        covered.update(range(item["start"], item["end"] + 1))
+    if covered != set(range(1, total_pages + 1)):
+        return None
+
+    return sorted(plan, key=lambda item: item["start"])
+
+
+def _adopt_completed_chunk_if_present(item: dict) -> bool:
+    """父进程被中断时，Marker worker 可能已写出 source.md 但 status 仍停在 running。"""
+    chunk_dir = item["chunk_dir"]
+    chunk_md = chunk_dir / "source.md"
+    if not chunk_md.exists() or chunk_md.stat().st_size == 0:
+        return False
+
+    status = _read_chunk_status(chunk_dir)
+    if status.get("state") == "completed" and status.get("engine"):
+        return True
+
+    fixed = {
+        **status,
+        "chunk_id": item["chunk_id"],
+        "start_page": item["start"],
+        "end_page": item["end"],
+        "engine": status.get("engine") or "marker",
+        "state": "completed",
+        "last_step": status.get("last_step") or "source_md_adopted",
+        "error": None,
+        "log_path": str(chunk_dir / "marker.log"),
+    }
+    if fixed["last_step"] in {"marker_running", "init", "pdf_ready"}:
+        fixed["last_step"] = "source_md_adopted_after_interrupt"
+    _write_chunk_status(chunk_dir, fixed)
+    print(f"[preprocess] adopted completed chunk from existing source.md: {item['chunk_id']}", flush=True)
+    return True
 
 
 def _process_one_chunk(
@@ -379,34 +641,54 @@ def _process_one_chunk(
     chunk_pdf = Path(chunk_pdf_str)
     chunk_dir = Path(chunk_dir_str)
     chunk_md = chunk_dir / "source.md"
+    log_path = chunk_dir / "marker.log"
 
     status = {
         "chunk_id": chunk_id,
         "start_page": start,
         "end_page": end,
         "engine": None,
+        "state": "running",
+        "last_step": "init",
         "error": None,
         "ts": int(time.time()),
+        "log_path": str(log_path),
     }
+    _write_chunk_status(chunk_dir, status)
 
     try:
         if not chunk_pdf.exists():
+            status["last_step"] = "extract_pdf_pages"
+            _write_chunk_status(chunk_dir, status)
             _extract_pdf_pages(pdf_path, chunk_pdf, start, end)
+        status["last_step"] = "pdf_ready"
+        _write_chunk_status(chunk_dir, status)
         try:
+            status["last_step"] = "marker_running"
+            _write_chunk_status(chunk_dir, status)
             _run_marker_subprocess(chunk_pdf, chunk_dir, chunk_timeout, chunk_id)
             status["engine"] = "marker"
+            status["state"] = "completed"
+            status["last_step"] = "marker_done"
+            status["error"] = None
         except Exception as e:
             status["error"] = f"{type(e).__name__}: {e}"
             if chunk_fallback == "fail":
                 status["engine"] = "failed"
+                status["state"] = "failed"
+                status["last_step"] = "marker_failed"
                 _write_chunk_status(chunk_dir, status)
                 raise
             if chunk_fallback == "skip":
                 print(f"[preprocess] marker failed for {chunk_id} ({e}); skipping chunk", file=sys.stderr)
                 chunk_md.write_text("", encoding="utf-8")
                 status["engine"] = "skip"
+                status["state"] = "completed"
+                status["last_step"] = "skip_empty_chunk"
             else:
                 print(f"[preprocess] marker failed for {chunk_id} ({e}); falling back to pymupdf", file=sys.stderr)
+                status["last_step"] = "fallback_running"
+                _write_chunk_status(chunk_dir, status)
                 preprocess_pdf_fallback(
                     pdf_path,
                     chunk_dir,
@@ -414,8 +696,15 @@ def _process_one_chunk(
                     end_page=end,
                 )
                 status["engine"] = "pymupdf"
-    finally:
+                status["state"] = "completed"
+                status["last_step"] = "fallback_done"
+    except Exception:
+        status["state"] = "failed"
+        if status.get("last_step") == "init":
+            status["last_step"] = "failed_before_start"
         _write_chunk_status(chunk_dir, status)
+        raise
+    _write_chunk_status(chunk_dir, status)
     return status
 
 
@@ -423,8 +712,8 @@ def preprocess_pdf_chunked(
     pdf_path: Path,
     outdir: Path,
     *,
-    chunk_pages: int = 12,
-    chunk_timeout: int = 300,
+    chunk_pages: int = 6,
+    chunk_timeout: int = 900,
     chunk_fallback: str = "pymupdf",
     resume: bool = False,
     chunk_concurrency: int = 1,
@@ -441,34 +730,59 @@ def preprocess_pdf_chunked(
     chunks_dir = outdir / "preprocess_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 规划所有分块
-    plan: list[dict] = []
-    for start in range(1, total_pages + 1, chunk_pages):
-        end = min(start + chunk_pages - 1, total_pages)
-        chunk_id = f"chunk_{((start - 1) // chunk_pages) + 1:03d}_p{start:03d}-p{end:03d}"
-        chunk_dir = chunks_dir / chunk_id
-        chunk_pdf = chunk_dir / f"{chunk_id}.pdf"
-        plan.append({
-            "chunk_id": chunk_id,
-            "start": start,
-            "end": end,
-            "chunk_dir": chunk_dir,
-            "chunk_pdf": chunk_pdf,
-        })
+    # 1. 规划所有分块。resume 时优先沿用旧 progress.json，避免默认 chunk_pages 调整后无法复用旧现场。
+    plan = _load_resume_plan_from_progress(chunks_dir, total_pages) if resume else None
+    if plan:
+        print(f"[preprocess] resume: reuse previous chunk plan from progress.json ({len(plan)} chunks)", flush=True)
+    else:
+        plan = []
+        for start in range(1, total_pages + 1, chunk_pages):
+            end = min(start + chunk_pages - 1, total_pages)
+            chunk_id = f"chunk_{((start - 1) // chunk_pages) + 1:03d}_p{start:03d}-p{end:03d}"
+            chunk_dir = chunks_dir / chunk_id
+            chunk_pdf = chunk_dir / f"{chunk_id}.pdf"
+            plan.append({
+                "chunk_id": chunk_id,
+                "start": start,
+                "end": end,
+                "chunk_dir": chunk_dir,
+                "chunk_pdf": chunk_pdf,
+            })
 
     # 2. 筛出需要执行的分块
     todo: list[dict] = []
     for item in plan:
         chunk_dir = item["chunk_dir"]
+        chunk_pdf = item["chunk_pdf"]
         chunk_md = chunk_dir / "source.md"
+
+        completed_from_disk = _adopt_completed_chunk_if_present(item)
         status = _read_chunk_status(chunk_dir)
+        engine = status.get("engine")
+        state = status.get("state")
+
+        if completed_from_disk:
+            if retry_fallback and engine in {"pymupdf", "skip", "failed"}:
+                print(f"[preprocess] retry-fallback: rerun {item['chunk_id']} (was engine={engine})", flush=True)
+            else:
+                print(f"[preprocess] reuse completed chunk: {item['chunk_id']} engine={engine or 'unknown'}", flush=True)
+                continue
 
         if resume and chunk_md.exists() and chunk_md.stat().st_size > 0:
-            if retry_fallback and status.get("engine") in {"pymupdf", "skip", "failed"}:
-                print(f"[preprocess] retry-fallback: rerun {item['chunk_id']} (was engine={status.get('engine')})")
+            if retry_fallback and engine in {"pymupdf", "skip", "failed"}:
+                print(f"[preprocess] retry-fallback: rerun {item['chunk_id']} (was engine={engine})", flush=True)
             else:
-                print(f"[preprocess] resume chunk exists: {item['chunk_id']} engine={status.get('engine') or 'unknown'}")
+                print(f"[preprocess] resume chunk exists: {item['chunk_id']} engine={engine or 'unknown'}", flush=True)
                 continue
+
+        if resume and (chunk_pdf.exists() or status):
+            print(
+                f"[preprocess] resume interrupted chunk: {item['chunk_id']} "
+                f"state={state or 'unknown'} engine={engine or 'unknown'} pdf_exists={chunk_pdf.exists()}"
+            )
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            todo.append(item)
+            continue
 
         # 需要（重新）执行：清空目录
         if chunk_dir.exists():
@@ -476,11 +790,16 @@ def preprocess_pdf_chunked(
         chunk_dir.mkdir(parents=True, exist_ok=True)
         todo.append(item)
 
+    todo_ids = [item["chunk_id"] for item in todo]
+    _write_progress_file(chunks_dir, plan, todo_ids)
+
     # 3. 执行：并行 or 串行
     concurrency = max(1, int(chunk_concurrency))
     if todo:
         print(f"[preprocess] chunked marker: total={len(plan)} todo={len(todo)} "
               f"chunk_pages={chunk_pages} chunk_timeout={chunk_timeout}s concurrency={concurrency}")
+    else:
+        print(f"[preprocess] chunked marker: nothing to do, using existing {len(plan)} chunks")
 
     if todo and concurrency > 1:
         with ProcessPoolExecutor(max_workers=concurrency) as pool:
@@ -507,8 +826,10 @@ def preprocess_pdf_chunked(
                     print(f"[preprocess] chunk done [{done}/{len(todo)}] {cid} engine={st.get('engine')}")
                 except Exception as e:
                     print(f"[preprocess] chunk FAILED [{done}/{len(todo)}] {cid}: {e}", file=sys.stderr)
+                    _write_progress_file(chunks_dir, plan, todo_ids)
                     if chunk_fallback == "fail":
                         raise
+                _write_progress_file(chunks_dir, plan, todo_ids)
     else:
         for idx, item in enumerate(todo, start=1):
             try:
@@ -525,8 +846,12 @@ def preprocess_pdf_chunked(
                 print(f"[preprocess] chunk done [{idx}/{len(todo)}] {item['chunk_id']} engine={st.get('engine')}")
             except Exception as e:
                 print(f"[preprocess] chunk FAILED [{idx}/{len(todo)}] {item['chunk_id']}: {e}", file=sys.stderr)
+                _write_progress_file(chunks_dir, plan, todo_ids)
                 if chunk_fallback == "fail":
                     raise
+            _write_progress_file(chunks_dir, plan, todo_ids)
+
+    _write_progress_file(chunks_dir, plan, todo_ids=[])
 
     # 4. 合并所有分块输出
     combined = []
@@ -607,10 +932,10 @@ def preprocess(
     outdir: Path,
     *,
     pdf_engine: str = "auto",
-    marker_timeout: int = 900,
+    marker_timeout: int = 1800,
     large_pdf_pages: int = 20,
-    pdf_chunk_pages: int = 12,
-    chunk_timeout: int = 300,
+    pdf_chunk_pages: int = 6,
+    chunk_timeout: int = 900,
     chunk_fallback: str = "pymupdf",
     resume: bool = False,
     chunk_concurrency: int = 1,
@@ -712,10 +1037,11 @@ def main():
     ap.add_argument("--kind", choices=["pdf", "html", "arxiv_html", "markdown"])
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--pdf-engine", choices=["auto", "marker", "pymupdf", "marker-chunked"], default="auto")
-    ap.add_argument("--marker-timeout", type=int, default=900)
+    ap.add_argument("--marker-timeout", type=int, default=1800)
     ap.add_argument("--large-pdf-pages", type=int, default=20)
-    ap.add_argument("--pdf-chunk-pages", type=int, default=12)
-    ap.add_argument("--chunk-timeout", type=int, default=300)
+    ap.add_argument("--pdf-chunk-pages", type=int, default=6)
+    ap.add_argument("--chunk-timeout", type=int, default=900,
+                    help="base timeout seconds for each Marker chunk; active OCR logs may extend up to 3x")
     ap.add_argument("--chunk-fallback", choices=["pymupdf", "skip", "fail"], default="pymupdf")
     ap.add_argument("--chunk-concurrency", type=int, default=1,
                     help="parallel workers for chunked marker; each worker loads its own model")
