@@ -10,8 +10,8 @@ description: |
   表格默认采用“截图入文”策略（pdfplumber + pymupdf），避免复杂表格被 Marker 抓成乱码、
   并保证导出的 Markdown / Word 中表格清晰完整。PDF 预处理采用小文件整篇 Marker 超时回退、
   大文件分块 Marker 单块回退的组合策略，支持分块并行 + status.json
-  断点修复；翻译调度输出 waves.json，同 wave 内单元可并发调用 LLM。finalize 阶段将图片资源
-  镜像为 <stem>.assets/ 并改写译文引用，保证单独搬运 Markdown / 导出为 Word 时图片不破。
+  断点修复；翻译调度输出 waves.json，同 wave 内单元可并发调用 LLM。finalize 阶段保留 `assets/`
+  作为最终 Markdown 的主图片路径，并镜像出 <stem>.assets/ 作为便携副本，同时生成图片链接校验报告。
   整体流程采用平台中立的文件协议，可在 WorkBuddy、OpenClaw 或其他可读写文件并调用 LLM 的平台运行。
   触发词：翻译论文、翻译技术论文、翻译学术论文、翻译 arxiv、arxiv 翻译、论文汉化、
   paper translation、translate paper、英译中论文、paper to Chinese、学术翻译。
@@ -53,10 +53,11 @@ entrypoint: scripts/run.py
 
 ## 输出
 
-- `<paper_stem>.zh.md` —— 中文译文（图片引用指向 `<paper_stem>.assets/`）
-- `<paper_stem>.assets/` —— 译文专属的图片目录（finalize 阶段从 `assets/` 镜像而来）
+- `<paper_stem>.zh.md` —— 中文译文（图片引用默认指向同级 `assets/`，兼容多数 Markdown 预览器）
+- `assets/` —— 最终 Markdown 的主图片目录
+- `<paper_stem>.assets/` —— finalize 阶段从 `assets/` 镜像出的便携副本，便于打包搬运
+- `<paper_stem>.zh.images.json` —— 本地图片链接存在性校验报告
 - `<paper_stem>.qa.md` —— 质检报告
-- `assets/` —— 预处理阶段原始图片（调试用，与 `<paper_stem>.assets/` 内容相同）
 - 可选 `<paper_stem>.bilingual.md` —— 双语对照（`--bilingual` 启用）
 - 可选 `<paper_stem>.zh.docx` —— Word 文档（`--export-docx` 启用，需 pandoc）
 
@@ -103,10 +104,10 @@ python3 "$SKILL_DIR/scripts/run.py" \
 --hybrid-max-chars N hybrid 模式下单个翻译单元最大字符数（默认 12000）
 --table-mode MODE    表格策略：lock / translate（默认 lock）
 --pdf-engine MODE    PDF 解析：auto / marker / pymupdf / marker-chunked（默认 auto）
---marker-timeout N   整篇 Marker 超时时间秒数（默认 1800）
---large-pdf-pages N  auto 模式下超过 N 页改用分块 Marker（默认 20）
---pdf-chunk-pages N  分块 Marker 每块页数（默认 6；页数越小，单块 OCR 越快、越不容易被宿主超时中断）
---chunk-timeout N    分块 Marker 单块基础超时时间秒数（默认 900；OCR 日志仍活跃时自动宽限到最多 3 倍）
+--marker-timeout N   整篇 Marker 超时时间秒数（默认 900；按实测 65-75s/页，正文 ≤8 页走整篇模式时 900s 留 1.6x 余量）
+--large-pdf-pages N  auto 模式下，去掉 References 后的正文页数超过 N 页则改用分块 Marker（默认 8）
+--pdf-chunk-pages N  分块 Marker 每块页数（默认 4；按 70s/页，单块约 280s，远低于 chunk-timeout，降低宿主中断风险）
+--chunk-timeout N    分块 Marker 单块基础超时时间秒数（默认 600；OCR 日志仍活跃时自动宽限到最多 3 倍）
 --chunk-fallback M   单块失败策略：pymupdf / skip / fail（默认 pymupdf）
 --chunk-concurrency N 分块 Marker 并行 worker 数（默认 1；每个 worker 加载 ~1-2GB 模型，建议 2、4）
 --progress-interval N Marker 与分块 PDF 预处理的心跳输出间隔秒数（默认 30；用于大 PDF 长时间运行时确认仍在执行）

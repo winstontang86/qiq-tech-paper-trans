@@ -365,13 +365,13 @@ def main():
                     help="(prepare) reuse existing source.md, segments.json and completed chunk outputs when possible")
     ap.add_argument("--pdf-engine", choices=["auto", "marker", "pymupdf", "marker-chunked"], default="auto",
                     help="PDF preprocess engine: auto uses full Marker for small PDFs and chunked Marker for large PDFs")
-    ap.add_argument("--marker-timeout", type=int, default=1800,
-                    help="timeout seconds for full-PDF Marker in auto/marker mode")
-    ap.add_argument("--large-pdf-pages", type=int, default=20,
-                    help="auto mode switches to chunked Marker when PDF pages exceed this threshold")
-    ap.add_argument("--pdf-chunk-pages", type=int, default=6,
-                    help="pages per chunk for marker-chunked mode; smaller chunks reduce long OCR idle/session timeout risk")
-    ap.add_argument("--chunk-timeout", type=int, default=900,
+    ap.add_argument("--marker-timeout", type=int, default=900,
+                    help="timeout seconds for full-PDF Marker in auto/marker mode (≈ 8 pages × 70s + buffer)")
+    ap.add_argument("--large-pdf-pages", type=int, default=8,
+                    help="auto mode switches to chunked Marker when marker_pages (after main-body truncation) > this")
+    ap.add_argument("--pdf-chunk-pages", type=int, default=4,
+                    help="pages per chunk for marker-chunked mode (4 pages ≈ 280s @ 70s/page, safely under chunk-timeout)")
+    ap.add_argument("--chunk-timeout", type=int, default=600,
                     help="base timeout seconds for each Marker chunk; active OCR logs may extend up to 3x")
     ap.add_argument("--chunk-fallback", choices=["pymupdf", "skip", "fail"], default="pymupdf",
                     help="fallback policy when a Marker chunk fails or times out")

@@ -254,6 +254,27 @@ def _write_marker_output(pdf_path: Path, outdir: Path) -> Path:
     md_path = outdir / "source.md"
     md_path.write_text(_clean_text(text), encoding="utf-8")
     print(f"[preprocess] marker worker wrote {md_path}", flush=True)
+
+    # 抗异常关键点：worker 在 source.md 落盘后立即把 status 标为 completed。
+    # 这样即使父进程随后被外部中断（SIGTERM/SIGINT/WorkBuddy session/prompt 中断），
+    # 这一块的成果也不会被下次 --resume 误判为 running 或 pending 而重跑。
+    try:
+        existing = _read_chunk_status(outdir)
+        worker_status = {
+            **existing,
+            "chunk_id": existing.get("chunk_id") or outdir.name,
+            "engine": "marker",
+            "state": "completed",
+            "last_step": "marker_done_by_worker",
+            "error": None,
+            "worker_pid": os.getpid(),
+            "worker_finished_at": _now_iso(),
+        }
+        _write_chunk_status(outdir, worker_status)
+        print(f"[preprocess] marker worker persisted completed status for {outdir.name}", flush=True)
+    except Exception as e:
+        print(f"[preprocess] marker worker status persist failed: {e}", file=sys.stderr, flush=True)
+
     return md_path
 
 
@@ -452,6 +473,97 @@ def _extract_pdf_pages(src_pdf: Path, dst_pdf: Path, start_page: int, end_page: 
         dst.close()
         src.close()
     return dst_pdf
+
+
+# References / Bibliography / 参考文献 标题在 PDF 文本层中的检测模式。
+# 匹配策略：整行独立出现，允许编号前缀（如 "6 References" / "6. References"）、允许大小写。
+_REFERENCES_HEADING_PATTERNS = [
+    re.compile(r"^\s*(?:\d+[\.\s]+)?references\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*(?:\d+[\.\s]+)?bibliography\s*$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*参考文献\s*$", re.MULTILINE),
+]
+
+
+def _detect_main_body_end_page(pdf_path: Path) -> int | None:
+    """在 PDF 文本层里找 References / Bibliography / 参考文献 标题，返回正文结束页（1-based 闭区间）。
+
+    返回：
+      - 若检测到 References 标题：返回 references_page - 1（正文最后一页）。
+      - 若 references 出现在第 1 页（极短文档或解析异常）：返回 None，不截断。
+      - 若未检测到：返回 None，走全量处理。
+
+    注意：只扫每页前半部分文本，避免匹配到正文中 "see References [12]" 这种行内提法。
+    """
+    try:
+        import fitz  # pymupdf
+    except ImportError:
+        return None
+
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:
+        return None
+
+    try:
+        total = doc.page_count
+        # 从后往前扫描，典型论文 References 在靠后 1/3，提速
+        scan_start = max(1, int(total * 0.35))
+        for page_idx in range(scan_start - 1, total):
+            try:
+                text = doc[page_idx].get_text("text") or ""
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            for pat in _REFERENCES_HEADING_PATTERNS:
+                m = pat.search(text)
+                if m:
+                    page_1based = page_idx + 1
+                    # 如果 References 出现在第 1 页，不截断（异常）
+                    if page_1based <= 1:
+                        return None
+                    return page_1based - 1
+        return None
+    finally:
+        doc.close()
+
+
+def _prepare_main_body_pdf(
+    pdf_path: Path,
+    outdir: Path,
+    *,
+    total_pages: int,
+) -> tuple[Path, int, int | None]:
+    """Marker 前置处理：若能检测到 References，先裁出正文 PDF，只让 Marker 处理正文。
+
+    返回：
+      (marker_input_pdf, marker_pages, main_body_end_page)
+      - marker_input_pdf：后续 Marker 使用的 PDF 路径（可能是原 PDF 或裁剪后的正文 PDF）。
+      - marker_pages：Marker 实际需要处理的页数。
+      - main_body_end_page：1-based 闭区间正文结束页；None 表示未截断。
+    """
+    end_page = _detect_main_body_end_page(pdf_path)
+    if not end_page or end_page >= total_pages:
+        return pdf_path, total_pages, None
+
+    body_pdf = outdir / f"{pdf_path.stem}.main_body.pdf"
+    try:
+        _extract_pdf_pages(pdf_path, body_pdf, 1, end_page)
+    except Exception as e:
+        print(
+            f"[preprocess] main-body truncation failed ({e}); falling back to full PDF",
+            file=sys.stderr, flush=True,
+        )
+        return pdf_path, total_pages, None
+
+    saved = total_pages - end_page
+    print(
+        f"[preprocess] main-body truncation: references detected at page {end_page + 1}; "
+        f"marker will process pages 1-{end_page} ({end_page}/{total_pages} pages, "
+        f"saved {saved} pages ≈ {saved * 70}s)",
+        flush=True,
+    )
+    return body_pdf, end_page, end_page
 
 
 def preprocess_pdf_fallback(
@@ -765,6 +877,11 @@ def _process_one_chunk(
             status["state"] = "completed"
             status["last_step"] = "marker_done"
             status["error"] = None
+            # 抗异常关键点：subprocess 返回成功就立刻把 completed 状态落盘，
+            # 不要等 _process_one_chunk 整个函数走完。这样即使后续步骤失败或父进程被外部中断，
+            # 这一块也能在下次 --resume / progress 汇总时被识别为已完成。
+            status["elapsed_seconds"] = int(time.monotonic() - started)
+            _write_chunk_status(chunk_dir, status)
         except Exception as e:
             status["error"] = f"{type(e).__name__}: {e}"
             if chunk_fallback == "fail":
@@ -807,8 +924,8 @@ def preprocess_pdf_chunked(
     pdf_path: Path,
     outdir: Path,
     *,
-    chunk_pages: int = 6,
-    chunk_timeout: int = 900,
+    chunk_pages: int = 4,
+    chunk_timeout: int = 600,
     chunk_fallback: str = "pymupdf",
     resume: bool = False,
     chunk_concurrency: int = 1,
@@ -983,6 +1100,16 @@ def preprocess_pdf_chunked(
         stop_heartbeat.set()
         if heartbeat_thread:
             heartbeat_thread.join(timeout=2)
+        # 抗异常关键点：即使被 KeyboardInterrupt / SystemExit / 外部 SIGTERM 中断，
+        # finally 也会扫一遍磁盘：已经产出非空 source.md 的 chunk 统一落盘为 completed，
+        # 并把最新 progress.json 写一次，避免 status.json 永远停在 running。
+        try:
+            for item in plan:
+                _adopt_completed_chunk_if_present(item)
+            with progress_lock:
+                _write_progress_file(chunks_dir, plan, current_todo_ids())
+        except Exception as sync_err:
+            print(f"[preprocess] final status sync failed: {sync_err}", file=sys.stderr, flush=True)
 
     write_progress(ids=[])
 
@@ -1065,10 +1192,10 @@ def preprocess(
     outdir: Path,
     *,
     pdf_engine: str = "auto",
-    marker_timeout: int = 1800,
-    large_pdf_pages: int = 20,
-    pdf_chunk_pages: int = 6,
-    chunk_timeout: int = 900,
+    marker_timeout: int = 900,
+    large_pdf_pages: int = 8,
+    pdf_chunk_pages: int = 4,
+    chunk_timeout: int = 600,
     chunk_fallback: str = "pymupdf",
     resume: bool = False,
     chunk_concurrency: int = 1,
@@ -1093,15 +1220,24 @@ def preprocess(
             if table_strategy == "image":
                 _apply_table_images_to_existing_md(input_path, outdir, md)
             return md
+
+        # 性能关键优化：所有 Marker 路径前置一次"正文截断"。
+        # Marker 实测耗时约 65-75s/页；把 References / Appendix 直接丢掉，
+        # 能显著减少整篇或分块 Marker 的处理量。
+        total_pages = _pdf_page_count(input_path)
+        marker_pdf, marker_pages, main_body_end = _prepare_main_body_pdf(
+            input_path, outdir, total_pages=total_pages,
+        )
+
         if pdf_engine == "marker":
             return preprocess_pdf_marker(
-                input_path, outdir, timeout=marker_timeout,
+                marker_pdf, outdir, timeout=marker_timeout,
                 table_strategy=table_strategy,
                 progress_interval=progress_interval,
             )
         if pdf_engine == "marker-chunked":
             return preprocess_pdf_chunked(
-                input_path,
+                marker_pdf,
                 outdir,
                 chunk_pages=pdf_chunk_pages,
                 chunk_timeout=chunk_timeout,
@@ -1113,16 +1249,19 @@ def preprocess(
                 progress_interval=progress_interval,
             )
 
-        pages = _pdf_page_count(input_path)
-        print(f"[preprocess] pdf pages={pages} engine=auto")
-        if pages > large_pdf_pages:
+        print(
+            f"[preprocess] pdf pages={total_pages} marker_pages={marker_pages} "
+            f"main_body_end={main_body_end} engine=auto"
+        )
+        if marker_pages > large_pdf_pages:
             print(
-                f"[preprocess] pages>{large_pdf_pages}; using chunked marker "
+                f"[preprocess] marker_pages>{large_pdf_pages}; using chunked marker "
                 f"chunk_pages={pdf_chunk_pages} chunk_timeout={chunk_timeout}s "
-                f"concurrency={chunk_concurrency} progress_interval={progress_interval}s"
+                f"concurrency={chunk_concurrency} progress_interval={progress_interval}s "
+                f"(est. {marker_pages * 70}s total @ 70s/page)"
             )
             return preprocess_pdf_chunked(
-                input_path,
+                marker_pdf,
                 outdir,
                 chunk_pages=pdf_chunk_pages,
                 chunk_timeout=chunk_timeout,
@@ -1136,7 +1275,7 @@ def preprocess(
 
         try:
             return preprocess_pdf_marker(
-                input_path, outdir, timeout=marker_timeout,
+                marker_pdf, outdir, timeout=marker_timeout,
                 table_strategy=table_strategy,
                 progress_interval=progress_interval,
             )
@@ -1175,10 +1314,10 @@ def main():
     ap.add_argument("--kind", choices=["pdf", "html", "arxiv_html", "markdown"])
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--pdf-engine", choices=["auto", "marker", "pymupdf", "marker-chunked"], default="auto")
-    ap.add_argument("--marker-timeout", type=int, default=1800)
-    ap.add_argument("--large-pdf-pages", type=int, default=20)
-    ap.add_argument("--pdf-chunk-pages", type=int, default=6)
-    ap.add_argument("--chunk-timeout", type=int, default=900,
+    ap.add_argument("--marker-timeout", type=int, default=900)
+    ap.add_argument("--large-pdf-pages", type=int, default=8)
+    ap.add_argument("--pdf-chunk-pages", type=int, default=4)
+    ap.add_argument("--chunk-timeout", type=int, default=600,
                     help="base timeout seconds for each Marker chunk; active OCR logs may extend up to 3x")
     ap.add_argument("--chunk-fallback", choices=["pymupdf", "skip", "fail"], default="pymupdf")
     ap.add_argument("--chunk-concurrency", type=int, default=1,
